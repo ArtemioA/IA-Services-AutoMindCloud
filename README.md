@@ -1,0 +1,1 @@
+# IA-Services-AutoMindCloud
