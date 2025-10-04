@@ -1,25 +1,28 @@
-# server_min.py — tiny Cloud Run app: instant bind + lazy model load
+# main.py — Cloud Run: bind instantáneo + carga perezosa del modelo
 import os, threading
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
-# ---- Fast boot (no heavy imports at import-time) ----
+# ---- App ligera (sin imports pesados al inicio) ----
 app = FastAPI(title="Qwen2-VL (minimal)")
 
+# Config mínima (ajústalas en Cloud Run si quieres)
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 MODEL_DIR  = os.environ.get("MODEL_DIR",  "/tmp/qwen2vl")
-ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"  # set 0 in prod if you bake the model
+ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"  # 0 si horneas el modelo
 PORT = int(os.environ.get("PORT", "8080"))
 
-# writable caches on Cloud Run
+# Caches en /tmp (escritura permitida en Cloud Run)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
 
+# Estado global (simple)
 _state = {"ready": False, "error": None, "device": "cpu", "processor": None, "model": None}
 _gen_lock = threading.Lock()
 _load_once = threading.Lock()
 
+# --------- Schemas ----------
 class EvalRequest(BaseModel):
     input: str
     max_new_tokens: int | None = 128
@@ -28,6 +31,7 @@ class EvalResponse(BaseModel):
     output: str
     tokens_generated: int
 
+# --------- Utilidades ----------
 def _has_files(path: str) -> bool:
     try:
         import os
@@ -36,12 +40,13 @@ def _has_files(path: str) -> bool:
         return False
 
 def _background_load():
+    """Descarga (si ALLOW_DOWNLOAD=1 y no existe) y carga el modelo en memoria."""
     with _load_once:
         if _state["ready"]:
             return
         try:
-            # heavy imports only here
-            import os, torch
+            # Imports pesados solo aquí
+            import torch, os
             from huggingface_hub import snapshot_download
             from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
@@ -49,6 +54,7 @@ def _background_load():
             if not _has_files(MODEL_DIR):
                 if not ALLOW_DOWNLOAD:
                     raise RuntimeError(f"Model not present at {MODEL_DIR} and ALLOW_DOWNLOAD=0")
+                # Descarga anónima y reanudable
                 snapshot_download(
                     repo_id=MODEL_REPO,
                     local_dir=MODEL_DIR,
@@ -61,8 +67,10 @@ def _background_load():
             dtype = torch.float16 if device == "cuda" else torch.float32
             torch.set_num_threads(1)
 
-            proc = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True, local_files_only=True)
-            mdl  = Qwen2VLForConditionalGeneration.from_pretrained(
+            proc = AutoProcessor.from_pretrained(
+                MODEL_DIR, trust_remote_code=True, local_files_only=True
+            )
+            mdl = Qwen2VLForConditionalGeneration.from_pretrained(
                 MODEL_DIR,
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
@@ -72,22 +80,49 @@ def _background_load():
             )
             mdl.to(device).eval()
 
-            _state.update({"ready": True, "error": None, "device": device, "processor": proc, "model": mdl})
+            _state.update({
+                "ready": True, "error": None, "device": device,
+                "processor": proc, "model": mdl
+            })
         except Exception as e:
             _state.update({"ready": False, "error": repr(e)})
 
+# --------- Startup ----------
 @app.on_event("startup")
 def on_startup():
     threading.Thread(target=_background_load, daemon=True).start()
 
+# --------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"ok": True, "status": "ready" if _state["ready"] else "starting",
-            "device": _state["device"], "model_dir": MODEL_DIR, "error": _state["error"]}
+    return {
+        "ok": True,
+        "status": "ready" if _state["ready"] else "starting",
+        "device": _state["device"],
+        "model_dir": MODEL_DIR,
+        "error": _state["error"],
+    }
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ready" if _state["ready"] else "starting", "error": _state["error"]}
+
+# Diagnóstico de egress a Internet
+@app.get("/netcheck")
+def netcheck():
+    import requests
+    urls = [
+        "https://huggingface.co/api/models/Qwen/Qwen2-VL-2B-Instruct",
+        "https://cdn-lfs.huggingface.co",
+    ]
+    out = {}
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=6)
+            out[u] = {"status": r.status_code}
+        except Exception as e:
+            out[u] = {"error": repr(e)}
+    return out
 
 def _run(req: EvalRequest) -> EvalResponse:
     processor, model = _state["processor"], _state["model"]
@@ -106,12 +141,12 @@ def _run(req: EvalRequest) -> EvalResponse:
 @app.post("/v1/eval", response_model=EvalResponse)
 def eval_endpoint(req: EvalRequest, response: Response):
     if not _state["ready"]:
-        # if still loading, tell the client to retry soon
         response.headers["Retry-After"] = "5"
         raise HTTPException(status_code=503, detail="Model is loading")
     with _gen_lock:
         return _run(req)
 
+# --------- Entrypoint correcto ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server_min:app", host="0.0.0.0", port=PORT, workers=1)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=1)
