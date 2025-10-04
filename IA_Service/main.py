@@ -1,21 +1,26 @@
-# server.py — Qwen2-VL API (bg load + /tmp fallback + raíz con estado)
-import os, threading, logging, torch
+# server.py — Qwen2-VL API (bg load, offline/online modes, /tmp fallback, netcheck)
+import os, threading, logging, torch, requests
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-# -------- Config --------
+# ---------------- Config ----------------
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 MODEL_DIR  = os.environ.get("MODEL_DIR",  "/models/Qwen2-VL-2B-Instruct")
-DOWNLOAD_IF_MISSING = os.environ.get("DOWNLOAD_IF_MISSING", "0") == "1"  # 1: baja una vez al arrancar
-USE_LOCAL_ONLY      = os.environ.get("USE_LOCAL_ONLY", "1") == "1"       # 1: solo archivos locales
 
-# Forzar offline si es solo local y usar caches en /tmp (Cloud Run permite escribir en /tmp)
-if USE_LOCAL_ONLY:
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Modo de operación:
+#   OFFLINE (prod): USE_LOCAL_ONLY=1, DOWNLOAD_IF_MISSING=0  (modelo horneado)
+#   ONLINE  (dev) : USE_LOCAL_ONLY=0, DOWNLOAD_IF_MISSING=1  (descarga al arrancar si hay egress)
+DOWNLOAD_IF_MISSING = os.environ.get("DOWNLOAD_IF_MISSING", "0") == "1"
+USE_LOCAL_ONLY      = os.environ.get("USE_LOCAL_ONLY", "1") == "1"
+
+# Caches/vars recomendadas (Cloud Run solo escribe en /tmp):
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
+# Forzar offline si pediste solo local:
+if USE_LOCAL_ONLY:
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if device == "cuda" else torch.float32
@@ -24,15 +29,17 @@ torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("qwen2vl")
 
+# ---------------- App & Globals ----------------
 app = FastAPI(title="Qwen2-VL API (bg load)")
 processor = None
 model = None
 model_ready = False
 load_error = None
-gen_lock = threading.Lock()
+gen_lock = threading.Lock()  # serializa generate() para evitar OOM
 
+# ---------------- Helpers ----------------
 def _writable_dir_fallback(path: str) -> str:
-    """Si no puedo crear 'path', caer a /tmp/models/<basename>."""
+    """Si no puedo crear 'path', caigo a /tmp/models/<basename>."""
     try:
         os.makedirs(path, exist_ok=True)
         return path
@@ -43,7 +50,7 @@ def _writable_dir_fallback(path: str) -> str:
         return tmp_path
 
 def ensure_model_on_disk():
-    """Garantiza que el modelo exista en disco; si se permite, descarga una vez al arrancar."""
+    """Verifica/descarga el modelo en disco si está permitido."""
     global MODEL_DIR, load_error
     MODEL_DIR = _writable_dir_fallback(MODEL_DIR)
 
@@ -55,7 +62,7 @@ def ensure_model_on_disk():
         return
 
     if has_files:
-        log.info(f"[model] Found local model at {MODEL_DIR}")
+        log.info("[model] Found local model at %s", MODEL_DIR)
         return
 
     if not DOWNLOAD_IF_MISSING:
@@ -63,9 +70,10 @@ def ensure_model_on_disk():
         log.error("[model] %s", load_error)
         return
 
+    # Descargar (requiere egress a Internet)
     try:
-        log.info(f"[model] Downloading {MODEL_REPO} to {MODEL_DIR} ...")
         from huggingface_hub import snapshot_download
+        log.info("[model] Downloading %s to %s ...", MODEL_REPO, MODEL_DIR)
         snapshot_download(
             repo_id=MODEL_REPO,
             local_dir=MODEL_DIR,
@@ -77,7 +85,7 @@ def ensure_model_on_disk():
         log.exception("[model] Download failed")
 
 def load_model_into_memory():
-    """Carga processor+model en RAM/VRAM (sin red si USE_LOCAL_ONLY=1)."""
+    """Carga processor + model en RAM/VRAM (usa red solo si USE_LOCAL_ONLY=0)."""
     global processor, model, model_ready, load_error
     try:
         ensure_model_on_disk()
@@ -89,10 +97,10 @@ def load_model_into_memory():
         if USE_LOCAL_ONLY:
             kw["local_files_only"] = True
 
-        log.info(f"[model] Loading processor from {MODEL_DIR} (local_only={USE_LOCAL_ONLY})")
+        log.info("[model] Loading processor from %s (local_only=%s)", MODEL_DIR, USE_LOCAL_ONLY)
         proc = AutoProcessor.from_pretrained(MODEL_DIR, **kw)
 
-        log.info(f"[model] Loading model from {MODEL_DIR} (device={device}, dtype={dtype})")
+        log.info("[model] Loading model from %s (device=%s, dtype=%s)", MODEL_DIR, device, dtype)
         mdl = Qwen2VLForConditionalGeneration.from_pretrained(
             MODEL_DIR,
             torch_dtype=dtype,
@@ -108,6 +116,7 @@ def load_model_into_memory():
         model_ready = True
         load_error = None
         log.info("[model] Ready (dir=%s)", MODEL_DIR)
+
     except Exception as e:
         load_error = repr(e)
         model_ready = False
@@ -116,7 +125,7 @@ def load_model_into_memory():
 def kickoff_background_load():
     threading.Thread(target=load_model_into_memory, daemon=True).start()
 
-# -------- Schemas --------
+# ---------------- Schemas ----------------
 class EvalRequest(BaseModel):
     input: str
     max_new_tokens: int | None = 128
@@ -127,16 +136,45 @@ class EvalResponse(BaseModel):
     output: str
     tokens_generated: int
 
-# -------- Routes --------
+class LegacyPayload(BaseModel):
+    texto: str
+    max_new_tokens: int | None = 128
+    temperature: float | None = None
+    top_p: float | None = None
+
+# ---------------- Routes ----------------
 @app.get("/")
 def root():
     status = "ready" if model_ready else "starting"
-    return {"ok": True, "status": status, "device": device, "model_dir": MODEL_DIR, "error": load_error, "msg": "qwen2-vl up"}
+    return {
+        "ok": True,
+        "status": status,
+        "device": device,
+        "model_dir": MODEL_DIR,
+        "error": load_error,
+        "msg": "qwen2-vl up",
+    }
 
 @app.get("/healthz")
 def healthz():
     status = "ready" if model_ready else "starting"
     return {"status": status, "device": device, "model_dir": MODEL_DIR, "error": load_error}
+
+@app.get("/netcheck")
+def netcheck():
+    """Diagnóstico simple de egress; útil si la descarga falla."""
+    urls = [
+        "https://huggingface.co/api/models/Qwen/Qwen2-VL-2B-Instruct",
+        "https://cdn-lfs.huggingface.co",
+    ]
+    out = {}
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=5)
+            out[u] = {"status": r.status_code}
+        except Exception as e:
+            out[u] = {"error": repr(e)}
+    return out
 
 def _run(req: EvalRequest) -> EvalResponse:
     msgs = [{"role": "user", "content": [{"type": "text", "text": req.input}]}]
@@ -167,13 +205,7 @@ def eval_endpoint(req: EvalRequest, response: Response):
     with gen_lock:
         return _run(req)
 
-# Compatibilidad {"texto": "..."}
-class LegacyPayload(BaseModel):
-    texto: str
-    max_new_tokens: int | None = 128
-    temperature: float | None = None
-    top_p: float | None = None
-
+# Compatibilidad con payload antiguo {"texto": "..."}
 @app.post("/generate", response_model=EvalResponse)
 def generate_legacy(data: LegacyPayload, response: Response):
     req = EvalRequest(
@@ -184,12 +216,13 @@ def generate_legacy(data: LegacyPayload, response: Response):
     )
     return eval_endpoint(req, response)
 
+# ---------------- Startup ----------------
 @app.on_event("startup")
 def on_startup():
     kickoff_background_load()
 
+# ---------------- Entrypoint ----------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run("server:app", host="0.0.0.0", port=port, workers=1)
-
