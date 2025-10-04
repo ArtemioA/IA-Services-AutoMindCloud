@@ -75,11 +75,10 @@ def generate_text(user_text: str, max_new_tokens: int, do_sample: bool,
 @app.post("/generate")
 def generate(entrada: Entrada, authorization: Optional[str] = Header(default=None)):
     require_bearer(authorization)
-    out = generate_text(
+    return generate_text(
         user_text=entrada.texto,
         max_new_tokens=entrada.max_new_tokens or MAX_NEW_TOKENS,
         do_sample=bool(entrada.do_sample),
         temperature=float(entrada.temperature or 0.7),
         top_p=float(entrada.top_p or 0.9),
     )
-    return {"text": out}
