@@ -3,3 +3,4 @@ uvicorn[standard]
 transformers>=4.43.0
 torch>=2.3.0
 pillow
+torchvision>=0.18.0
