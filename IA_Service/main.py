@@ -1,31 +1,27 @@
-# server.py — Qwen2-VL API (auto-download, retries, local-only after first pull)
-import os, threading, logging, time, torch, requests
+# server.py — Qwen2-VL API (auto-download sin token, backoff 429, local-only tras primera descarga)
+import os, time, threading, logging, requests, torch
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 from huggingface_hub import snapshot_download, HfHubHTTPError
 
 # ---------------- Config ----------------
+# Repo del modelo y carpeta destino (Cloud Run solo escribe en /tmp)
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 MODEL_DIR  = os.environ.get("MODEL_DIR",  "/tmp/models/Qwen2-VL-2B-Instruct")
 
 # ONLINE (dev)  : USE_LOCAL_ONLY=0, DOWNLOAD_IF_MISSING=1 (descarga si falta)
-# OFFLINE (prod): USE_LOCAL_ONLY=1, DOWNLOAD_IF_MISSING=0 (modelo horneado)
+# OFFLINE (prod): USE_LOCAL_ONLY=1, DOWNLOAD_IF_MISSING=0 (modelo horneado en imagen)
 DOWNLOAD_IF_MISSING = os.environ.get("DOWNLOAD_IF_MISSING", "1") == "1"
 USE_LOCAL_ONLY      = os.environ.get("USE_LOCAL_ONLY", "0") == "1"
 
-# Token opcional (evita 429, acelera)
-HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
-
-# Caches/vars recomendadas (Cloud Run solo escribe en /tmp):
+# Caches/vars recomendadas (Cloud Run-friendly)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
-
-# Si pides solo local, no toques la red desde Transformers:
 if USE_LOCAL_ONLY:
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # evita red en carga local
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.float16 if device == "cuda" else torch.float32
@@ -40,12 +36,14 @@ processor = None
 model = None
 model_ready = False
 load_error = None
-gen_lock = threading.Lock()    # serializa generate() para evitar OOM
-_model_lock = threading.Lock() # evita carga doble
-_dl_lock = threading.Lock()    # evita descargas concurrentes
-_dl_done = False               # snapshot ya presente
 
-# ---------------- Helpers ----------------
+# Candados para evitar descargas/cargas concurrentes
+_dl_lock = threading.Lock()     # protege snapshot_download
+_model_lock = threading.Lock()  # protege from_pretrained
+gen_lock = threading.Lock()     # serializa generate() para evitar OOM
+_dl_done = False                # snapshot ya presente en disco
+
+# ---------------- Utils ----------------
 def _writable_dir_fallback(path: str) -> str:
     """Si no puedo crear 'path', caigo a /tmp/models/<basename>."""
     try:
@@ -54,7 +52,7 @@ def _writable_dir_fallback(path: str) -> str:
     except PermissionError:
         tmp_path = f"/tmp/models/{os.path.basename(path.rstrip('/'))}"
         os.makedirs(tmp_path, exist_ok=True)
-        log.warning("[model] No write perms on %s; falling back to %s", path, tmp_path)
+        log.warning("[model] No write perms on %s; fallback -> %s", path, tmp_path)
         return tmp_path
 
 def _has_files(path: str) -> bool:
@@ -64,8 +62,14 @@ def _has_files(path: str) -> bool:
         log.error("[model] Cannot scan MODEL_DIR %s: %r", path, e)
         return False
 
-def ensure_model_on_disk(max_retries: int = 5) -> None:
-    """Descarga el snapshot si no existe; reintenta si HF devuelve 429."""
+# ---------------- Download & Load ----------------
+def ensure_model_on_disk(max_retries: int = 8) -> None:
+    """
+    Descarga el snapshot si no existe. Sin token:
+      - reduce paralelismo (max_workers=2)
+      - usa resume_download=True
+      - hace backoff exponencial ante 429
+    """
     global MODEL_DIR, _dl_done, load_error
     MODEL_DIR = _writable_dir_fallback(MODEL_DIR)
 
@@ -87,9 +91,10 @@ def ensure_model_on_disk(max_retries: int = 5) -> None:
         return
 
     with _dl_lock:
-        if _dl_done and _has_files(MODEL_DIR):
+        if _dl_done and _has_files(MODEL_DIR):  # otro hilo puede haber terminado
             return
-        log.info("[model] Downloading %s to %s ...", MODEL_REPO, MODEL_DIR)
+
+        log.info("[model] Downloading %s -> %s (no token, be patient)...", MODEL_REPO, MODEL_DIR)
         delay = 2
         for attempt in range(max_retries):
             try:
@@ -100,9 +105,8 @@ def ensure_model_on_disk(max_retries: int = 5) -> None:
                     local_files_only=False,   # permitir red
                     resume_download=True,     # reanuda si corta
                     revision="main",          # evita consultas extra
-                    token=HF_TOKEN,           # evita rate limit anónimo
-                    max_workers=4             # baja presión sobre el hub
-                    # allow_patterns=[...]    # opcional para acotar archivos
+                    max_workers=2             # baja presión al hub anónimo
+                    # allow_patterns= [...]   # opcional: acotar archivos
                 )
                 _dl_done = True
                 log.info("[model] Download complete")
@@ -110,25 +114,27 @@ def ensure_model_on_disk(max_retries: int = 5) -> None:
             except HfHubHTTPError as e:
                 sc = getattr(e.response, "status_code", None)
                 if sc == 429 and attempt < max_retries - 1:
-                    log.warning("[model] 429 rate limit; retrying in %ss...", delay)
+                    log.warning("[model] 429 rate limit; retry in %ss (attempt %d/%d)...",
+                                delay, attempt + 1, max_retries)
                     time.sleep(delay)
-                    delay = min(delay * 2, 30)
+                    delay = min(delay * 2, 60)  # backoff hasta 60s
                     continue
                 load_error = f"snapshot_download failed: {repr(e)}"
                 log.exception("[model] Download failed")
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
-                    log.warning("[model] Download error %r; retrying in %ss...", e, delay)
+                    log.warning("[model] Download error %r; retry in %ss (attempt %d/%d)...",
+                                e, delay, attempt + 1, max_retries)
                     time.sleep(delay)
-                    delay = min(delay * 2, 30)
+                    delay = min(delay * 2, 60)
                     continue
                 load_error = f"snapshot_download failed: {repr(e)}"
                 log.exception("[model] Download failed (final)")
                 return
 
 def load_model_into_memory() -> None:
-    """Carga processor + model en RAM/VRAM (luego queda todo local)."""
+    """Carga processor+model a RAM/VRAM. Tras descargar, se usa local-only."""
     global processor, model, model_ready, load_error
     with _model_lock:
         try:
@@ -137,11 +143,10 @@ def load_model_into_memory() -> None:
                 model_ready = False
                 return
 
-            kw = dict(trust_remote_code=True)
-            if USE_LOCAL_ONLY or _has_files(MODEL_DIR):
-                kw["local_files_only"] = True
+            local_only = True  # ya en disco; evita tocar red
+            kw = dict(trust_remote_code=True, local_files_only=local_only)
 
-            log.info("[model] Loading processor from %s (local_only=%s)", MODEL_DIR, kw.get("local_files_only", False))
+            log.info("[model] Loading processor from %s (local_only=%s)", MODEL_DIR, local_only)
             proc = AutoProcessor.from_pretrained(MODEL_DIR, **kw)
 
             log.info("[model] Loading model from %s (device=%s, dtype=%s)", MODEL_DIR, device, dtype)
@@ -244,7 +249,7 @@ def _run(req: EvalRequest) -> EvalResponse:
 @app.post("/v1/eval", response_model=EvalResponse)
 def eval_endpoint(req: EvalRequest, response: Response):
     if not model_ready:
-        # Carga perezosa (si aún no terminó el hilo en segundo plano)
+        # Carga perezosa: intenta cargar ahora (si el hilo bg no terminó)
         load_model_into_memory()
         if not model_ready:
             response.headers["Retry-After"] = "5"
@@ -252,7 +257,7 @@ def eval_endpoint(req: EvalRequest, response: Response):
     with gen_lock:
         return _run(req)
 
-# Compatibilidad con payload antiguo {"texto": "..."}
+# Compat anterior {"texto": "..."}
 @app.post("/generate", response_model=EvalResponse)
 def generate_legacy(data: LegacyPayload, response: Response):
     req = EvalRequest(
