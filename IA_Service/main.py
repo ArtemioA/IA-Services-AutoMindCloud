@@ -1,4 +1,3 @@
-# IA_Service/main.py
 import os
 from typing import Optional, Dict, Any
 from threading import Lock
@@ -8,17 +7,23 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
+# ---------- Config ----------
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2-VL-2B-Instruct")
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
 REQUIRE_BEARER = os.environ.get("REQUIRE_BEARER", "false").lower() == "true"
 API_TOKEN = os.environ.get("API_TOKEN", "")
-LOCAL_DIR = os.environ.get("MODEL_LOCAL_DIR")  # opcional: ruta con pesos ya “horneados”
+LOCAL_DIR = os.environ.get("MODEL_LOCAL_DIR")  # si horneas el modelo en la imagen, apunta aquí (ej. /app/models/Qwen2-VL-2B-Instruct)
+
+# Limita threads en CPU (reduce RAM/CPU en entornos serverless)
+torch.set_num_threads(1)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 app = FastAPI(title="Qwen2-VL Text Generator (lazy)", version="1.0.0")
 
-# ---- Estado global LAZY ----
+# ---------- Estado global (lazy load) ----------
 _model = None
 _processor = None
 _load_lock = Lock()
@@ -32,14 +37,13 @@ def _require_bearer(authorization: Optional[str]) -> None:
             raise HTTPException(status_code=403, detail="Invalid token")
 
 def _ensure_model_loaded():
-    """Carga el modelo/processor SOLO una vez, al primer request."""
+    """Carga modelo y processor SOLO al primer request."""
     global _model, _processor
     if _model is not None and _processor is not None:
         return
     with _load_lock:
         if _model is not None and _processor is not None:
             return
-        # Permite usar pesos locales si existen (más rápido si los horneas en la imagen)
         source = LOCAL_DIR if LOCAL_DIR and os.path.isdir(LOCAL_DIR) else MODEL_NAME
         _processor = AutoProcessor.from_pretrained(source, trust_remote_code=True)
         _model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -61,6 +65,7 @@ class Entrada(BaseModel):
 def _generate_text(user_text: str, max_new_tokens: int,
                    do_sample: bool, temperature: float, top_p: float) -> str:
     _ensure_model_loaded()
+
     messages = [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
     prompt = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -77,27 +82,32 @@ def _generate_text(user_text: str, max_new_tokens: int,
     with torch.inference_mode():
         out_ids = _model.generate(**inputs, **gen_kwargs)
 
+    # Extrae solo lo generado (quita el prompt)
     input_len = inputs["input_ids"].shape[-1]
     gen_ids = out_ids[0, input_len:]
     text = _processor.batch_decode(gen_ids.unsqueeze(0), skip_special_tokens=True)[0].strip()
+
     if text.startswith("assistant\n"):
         text = text[len("assistant\n"):].strip()
     return text
 
 @app.get("/healthz")
 def healthz():
-    # Salud inmediata: Cloud Run verá el puerto abierto y este endpoint responde rápido
     return {"ok": True}
 
-# Respuesta en texto plano (string puro)
+# Devuelve string plano (text/plain)
 @app.post("/generate")
 def generate(entrada: Entrada, authorization: Optional[str] = Header(default=None)):
-    _require_bearer(authorization)
-    out = _generate_text(
-        user_text=entrada.texto,
-        max_new_tokens=entrada.max_new_tokens or MAX_NEW_TOKENS,
-        do_sample=bool(entrada.do_sample),
-        temperature=float(entrada.temperature or 0.7),
-        top_p=float(entrada.top_p or 0.9),
-    )
-    return Response(out, media_type="text/plain")
+    try:
+        _require_bearer(authorization)
+        out = _generate_text(
+            user_text=entrada.texto,
+            max_new_tokens=entrada.max_new_tokens or MAX_NEW_TOKENS,
+            do_sample=bool(entrada.do_sample),
+            temperature=float(entrada.temperature or 0.7),
+            top_p=float(entrada.top_p or 0.9),
+        )
+        return Response(out, media_type="text/plain")
+    except Exception as e:
+        # Devuelve el error como texto (útil en pruebas). En prod, puedes ocultarlo.
+        return Response(f"ERROR: {type(e).__name__}: {e}", media_type="text/plain", status_code=500)
