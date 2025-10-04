@@ -13,21 +13,17 @@ MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
 REQUIRE_BEARER = os.environ.get("REQUIRE_BEARER", "false").lower() == "true"
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-# Opcional: si horneas el modelo en la imagen, apunta aquí
-# (si NO existe o está vacío, se descargará de HF en el primer request)
-MODEL_LOCAL_DIR = os.environ.get("MODEL_LOCAL_DIR", "").strip() or None
+# IMPORTANTE: no usar carpeta local hasta que realmente la hornees bien
+MODEL_LOCAL_DIR = None  # fuerza a cargar desde HF y evitar rutas incompletas
 
-# Si pones USE_SAFETENSORS=false, permitimos cargar .bin si el repo no trae .safetensors
-USE_SAFETENSORS = os.environ.get("USE_SAFETENSORS", "auto").lower()  # "auto" | "false"
-
-# Limita threads para ahorrar RAM/CPU en CPU-only
+# Limita threads en CPU (ahorra RAM/CPU)
 torch.set_num_threads(1)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-app = FastAPI(title="Qwen2-VL Text Generator (lazy)", version="1.0.0")
+app = FastAPI(title="Qwen2-VL Text Generator (lazy, no safetensors)", version="1.0.0")
 
 # ---------------- Estado global (lazy) ----------------
 _model = None
@@ -51,23 +47,21 @@ def _ensure_model_loaded():
         if _model is not None and _processor is not None:
             return
 
-        # Fuente: carpeta local horneada (si existe), si no el repo de HF
-        source = MODEL_LOCAL_DIR if (MODEL_LOCAL_DIR and os.path.isdir(MODEL_LOCAL_DIR)) else MODEL_NAME
+        # Fuente: SIEMPRE del repo de HF (evita carpetas locales incompletas)
+        source = MODEL_NAME
 
-        # Opcional: permitir .bin si no hay .safetensors
-        kwargs: Dict[str, Any] = {"trust_remote_code": True}
-        if USE_SAFETENSORS == "false":
-            kwargs["use_safetensors"] = False  # permitirá .bin
-
-        # Carga
-        _processor = AutoProcessor.from_pretrained(source, trust_remote_code=True)
-        _model = Qwen2VLForConditionalGeneration.from_pretrained(
-            source,
+        # Clave: NO forzar safetensors → permite .bin
+        common_kwargs: Dict[str, Any] = dict(trust_remote_code=True)
+        model_kwargs: Dict[str, Any] = dict(
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
             device_map="auto" if device == "cuda" else None,
-            **kwargs,
+            use_safetensors=False,  # <--- evita buscar *.safetensors
+            trust_remote_code=True,
         )
+
+        _processor = AutoProcessor.from_pretrained(source, **common_kwargs)
+        _model = Qwen2VLForConditionalGeneration.from_pretrained(source, **model_kwargs)
         if device == "cpu":
             _model.to(device)
 
@@ -110,7 +104,6 @@ def _generate_text(user_text: str, max_new_tokens: int,
 
 @app.get("/healthz")
 def healthz():
-    # Check rápido para health-check de Cloud Run
     return {"ok": True}
 
 # Devuelve string plano (text/plain)
@@ -127,5 +120,4 @@ def generate(entrada: Entrada, authorization: Optional[str] = Header(default=Non
         )
         return Response(out, media_type="text/plain")
     except Exception as e:
-        # Útil para depurar (puedes ocultarlo en producción)
         return Response(f"ERROR: {type(e).__name__}: {e}", media_type="text/plain", status_code=500)
