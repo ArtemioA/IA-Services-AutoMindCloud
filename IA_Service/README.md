@@ -1,1 +1,2 @@
-# IA-Services-AutoMindCloud
+fastapi
+uvicorn[standard]
