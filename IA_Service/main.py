@@ -1,24 +1,29 @@
-# server.py — Qwen2-VL API (bg load, offline/online modes, /tmp fallback, netcheck)
-import os, threading, logging, torch, requests
+# server.py — Qwen2-VL API (auto-download, retries, local-only after first pull)
+import os, threading, logging, time, torch, requests
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from huggingface_hub import snapshot_download, HfHubHTTPError
 
 # ---------------- Config ----------------
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR  = os.environ.get("MODEL_DIR",  "/models/Qwen2-VL-2B-Instruct")
+MODEL_DIR  = os.environ.get("MODEL_DIR",  "/tmp/models/Qwen2-VL-2B-Instruct")
 
-# Modo de operación:
-#   OFFLINE (prod): USE_LOCAL_ONLY=1, DOWNLOAD_IF_MISSING=0  (modelo horneado)
-#   ONLINE  (dev) : USE_LOCAL_ONLY=0, DOWNLOAD_IF_MISSING=1  (descarga al arrancar si hay egress)
-DOWNLOAD_IF_MISSING = os.environ.get("DOWNLOAD_IF_MISSING", "0") == "1"
-USE_LOCAL_ONLY      = os.environ.get("USE_LOCAL_ONLY", "1") == "1"
+# ONLINE (dev)  : USE_LOCAL_ONLY=0, DOWNLOAD_IF_MISSING=1 (descarga si falta)
+# OFFLINE (prod): USE_LOCAL_ONLY=1, DOWNLOAD_IF_MISSING=0 (modelo horneado)
+DOWNLOAD_IF_MISSING = os.environ.get("DOWNLOAD_IF_MISSING", "1") == "1"
+USE_LOCAL_ONLY      = os.environ.get("USE_LOCAL_ONLY", "0") == "1"
+
+# Token opcional (evita 429, acelera)
+HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
 
 # Caches/vars recomendadas (Cloud Run solo escribe en /tmp):
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
-# Forzar offline si pediste solo local:
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
+
+# Si pides solo local, no toques la red desde Transformers:
 if USE_LOCAL_ONLY:
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
@@ -30,12 +35,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("qwen2vl")
 
 # ---------------- App & Globals ----------------
-app = FastAPI(title="Qwen2-VL API (bg load)")
+app = FastAPI(title="Qwen2-VL API (auto-download)")
 processor = None
 model = None
 model_ready = False
 load_error = None
-gen_lock = threading.Lock()  # serializa generate() para evitar OOM
+gen_lock = threading.Lock()    # serializa generate() para evitar OOM
+_model_lock = threading.Lock() # evita carga doble
+_dl_lock = threading.Lock()    # evita descargas concurrentes
+_dl_done = False               # snapshot ya presente
 
 # ---------------- Helpers ----------------
 def _writable_dir_fallback(path: str) -> str:
@@ -49,20 +57,28 @@ def _writable_dir_fallback(path: str) -> str:
         log.warning("[model] No write perms on %s; falling back to %s", path, tmp_path)
         return tmp_path
 
-def ensure_model_on_disk():
-    """Verifica/descarga el modelo en disco si está permitido."""
-    global MODEL_DIR, load_error
+def _has_files(path: str) -> bool:
+    try:
+        return any(os.scandir(path))
+    except Exception as e:
+        log.error("[model] Cannot scan MODEL_DIR %s: %r", path, e)
+        return False
+
+def ensure_model_on_disk(max_retries: int = 5) -> None:
+    """Descarga el snapshot si no existe; reintenta si HF devuelve 429."""
+    global MODEL_DIR, _dl_done, load_error
     MODEL_DIR = _writable_dir_fallback(MODEL_DIR)
 
-    try:
-        has_files = any(os.scandir(MODEL_DIR))
-    except Exception as e:
-        load_error = f"Cannot scan MODEL_DIR {MODEL_DIR}: {e!r}"
-        log.error("[model] %s", load_error)
+    if _dl_done and _has_files(MODEL_DIR):
+        return
+    if _has_files(MODEL_DIR):
+        _dl_done = True
+        log.info("[model] Found local model at %s", MODEL_DIR)
         return
 
-    if has_files:
-        log.info("[model] Found local model at %s", MODEL_DIR)
+    if USE_LOCAL_ONLY:
+        load_error = f"Model dir {MODEL_DIR} is empty and USE_LOCAL_ONLY=1"
+        log.error("[model] %s", load_error)
         return
 
     if not DOWNLOAD_IF_MISSING:
@@ -70,57 +86,85 @@ def ensure_model_on_disk():
         log.error("[model] %s", load_error)
         return
 
-    # Descargar (requiere egress a Internet)
-    try:
-        from huggingface_hub import snapshot_download
-        log.info("[model] Downloading %s to %s ...", MODEL_REPO, MODEL_DIR)
-        snapshot_download(
-            repo_id=MODEL_REPO,
-            local_dir=MODEL_DIR,
-            local_dir_use_symlinks=False
-        )
-        log.info("[model] Download complete")
-    except Exception as e:
-        load_error = f"snapshot_download failed: {repr(e)}"
-        log.exception("[model] Download failed")
-
-def load_model_into_memory():
-    """Carga processor + model en RAM/VRAM (usa red solo si USE_LOCAL_ONLY=0)."""
-    global processor, model, model_ready, load_error
-    try:
-        ensure_model_on_disk()
-        if load_error:
-            model_ready = False
+    with _dl_lock:
+        if _dl_done and _has_files(MODEL_DIR):
             return
+        log.info("[model] Downloading %s to %s ...", MODEL_REPO, MODEL_DIR)
+        delay = 2
+        for attempt in range(max_retries):
+            try:
+                snapshot_download(
+                    repo_id=MODEL_REPO,
+                    local_dir=MODEL_DIR,
+                    local_dir_use_symlinks=False,
+                    local_files_only=False,   # permitir red
+                    resume_download=True,     # reanuda si corta
+                    revision="main",          # evita consultas extra
+                    token=HF_TOKEN,           # evita rate limit anónimo
+                    max_workers=4             # baja presión sobre el hub
+                    # allow_patterns=[...]    # opcional para acotar archivos
+                )
+                _dl_done = True
+                log.info("[model] Download complete")
+                return
+            except HfHubHTTPError as e:
+                sc = getattr(e.response, "status_code", None)
+                if sc == 429 and attempt < max_retries - 1:
+                    log.warning("[model] 429 rate limit; retrying in %ss...", delay)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
+                load_error = f"snapshot_download failed: {repr(e)}"
+                log.exception("[model] Download failed")
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    log.warning("[model] Download error %r; retrying in %ss...", e, delay)
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
+                load_error = f"snapshot_download failed: {repr(e)}"
+                log.exception("[model] Download failed (final)")
+                return
 
-        kw = dict(trust_remote_code=True)
-        if USE_LOCAL_ONLY:
-            kw["local_files_only"] = True
+def load_model_into_memory() -> None:
+    """Carga processor + model en RAM/VRAM (luego queda todo local)."""
+    global processor, model, model_ready, load_error
+    with _model_lock:
+        try:
+            ensure_model_on_disk()
+            if load_error:
+                model_ready = False
+                return
 
-        log.info("[model] Loading processor from %s (local_only=%s)", MODEL_DIR, USE_LOCAL_ONLY)
-        proc = AutoProcessor.from_pretrained(MODEL_DIR, **kw)
+            kw = dict(trust_remote_code=True)
+            if USE_LOCAL_ONLY or _has_files(MODEL_DIR):
+                kw["local_files_only"] = True
 
-        log.info("[model] Loading model from %s (device=%s, dtype=%s)", MODEL_DIR, device, dtype)
-        mdl = Qwen2VLForConditionalGeneration.from_pretrained(
-            MODEL_DIR,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map="auto" if device == "cuda" else None,
-            **kw,
-        )
-        mdl.to(device).eval()
-        torch.set_grad_enabled(False)
+            log.info("[model] Loading processor from %s (local_only=%s)", MODEL_DIR, kw.get("local_files_only", False))
+            proc = AutoProcessor.from_pretrained(MODEL_DIR, **kw)
 
-        processor = proc
-        model = mdl
-        model_ready = True
-        load_error = None
-        log.info("[model] Ready (dir=%s)", MODEL_DIR)
+            log.info("[model] Loading model from %s (device=%s, dtype=%s)", MODEL_DIR, device, dtype)
+            mdl = Qwen2VLForConditionalGeneration.from_pretrained(
+                MODEL_DIR,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="auto" if device == "cuda" else None,
+                **kw,
+            )
+            mdl.to(device).eval()
+            torch.set_grad_enabled(False)
 
-    except Exception as e:
-        load_error = repr(e)
-        model_ready = False
-        log.exception("[model] Load failed")
+            processor = proc
+            model = mdl
+            model_ready = True
+            load_error = None
+            log.info("[model] Ready (dir=%s)", MODEL_DIR)
+
+        except Exception as e:
+            load_error = repr(e)
+            model_ready = False
+            log.exception("[model] Load failed")
 
 def kickoff_background_load():
     threading.Thread(target=load_model_into_memory, daemon=True).start()
@@ -200,8 +244,11 @@ def _run(req: EvalRequest) -> EvalResponse:
 @app.post("/v1/eval", response_model=EvalResponse)
 def eval_endpoint(req: EvalRequest, response: Response):
     if not model_ready:
-        response.headers["Retry-After"] = "5"
-        raise HTTPException(status_code=503, detail="Model is loading")
+        # Carga perezosa (si aún no terminó el hilo en segundo plano)
+        load_model_into_memory()
+        if not model_ready:
+            response.headers["Retry-After"] = "5"
+            raise HTTPException(status_code=503, detail="Model is loading")
     with gen_lock:
         return _run(req)
 
