@@ -1,123 +1,98 @@
 import os
-from typing import Optional, Dict, Any
-from threading import Lock
-
 import torch
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 # ---------------- Config ----------------
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2-VL-2B-Instruct")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
-REQUIRE_BEARER = os.environ.get("REQUIRE_BEARER", "false").lower() == "true"
-API_TOKEN = os.environ.get("API_TOKEN", "")
-
-# IMPORTANTE: no usar carpeta local hasta que realmente la hornees bien
-MODEL_LOCAL_DIR = None  # fuerza a cargar desde HF y evitar rutas incompletas
-
-# Limita threads en CPU (ahorra RAM/CPU)
-torch.set_num_threads(1)
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2-VL-2B-Instruct")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.float16 if device == "cuda" else torch.float32
 
-app = FastAPI(title="Qwen2-VL Text Generator (lazy, no safetensors)", version="1.0.0")
+# Optional: control HF cache (helps avoid re-downloading between runs on the same machine)
+# os.environ["HF_HOME"] = "/root/.cache/huggingface"
 
-# ---------------- Estado global (lazy) ----------------
-_model = None
-_processor = None
-_load_lock = Lock()
+# ---------------- App ----------------
+app = FastAPI(title="Qwen2-VL-2B-Instruct Text API", version="1.0.0")
 
-def _require_bearer(authorization: Optional[str]) -> None:
-    if REQUIRE_BEARER:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing bearer token")
-        token = authorization.split(" ", 1)[1]
-        if token != API_TOKEN:
-            raise HTTPException(status_code=403, detail="Invalid token")
+class EvalRequest(BaseModel):
+    input: str
+    max_new_tokens: int | None = 128
+    temperature: float | None = None
+    top_p: float | None = None
 
-def _ensure_model_loaded():
-    """Carga modelo y processor SOLO la primera vez que se llama."""
-    global _model, _processor
-    if _model is not None and _processor is not None:
-        return
-    with _load_lock:
-        if _model is not None and _processor is not None:
-            return
+class EvalResponse(BaseModel):
+    output: str
+    tokens_generated: int
 
-        # Fuente: SIEMPRE del repo de HF (evita carpetas locales incompletas)
-        source = MODEL_NAME
+# Globals (populated at startup)
+processor = None
+model = None
 
-        # Clave: NO forzar safetensors → permite .bin
-        common_kwargs: Dict[str, Any] = dict(trust_remote_code=True)
-        model_kwargs: Dict[str, Any] = dict(
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            low_cpu_mem_usage=True,
+def build_messages(user_text: str):
+    # Qwen2-VL is chat-based and multimodal; here we only send pure text.
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_text}
+        ]
+    }]
+
+@app.on_event("startup")
+def load_model_once():
+    global processor, model
+    if processor is None or model is None:
+        # Load once, keep in memory for all requests
+        processor = AutoProcessor.from_pretrained(
+            MODEL_NAME, trust_remote_code=True
+        )
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=dtype,
             device_map="auto" if device == "cuda" else None,
-            use_safetensors=False,  # <--- evita buscar *.safetensors
-            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
+        # Put the text encoder/decoder on device if needed
+        model.to(device)
+        model.eval()
+        torch.set_grad_enabled(False)
 
-        _processor = AutoProcessor.from_pretrained(source, **common_kwargs)
-        _model = Qwen2VLForConditionalGeneration.from_pretrained(source, **model_kwargs)
-        if device == "cpu":
-            _model.to(device)
+@app.post("/v1/eval", response_model=EvalResponse)
+def eval_endpoint(req: EvalRequest):
+    global processor, model
+    if processor is None or model is None:
+        load_model_once()
 
-class Entrada(BaseModel):
-    texto: str
-    max_new_tokens: Optional[int] = None
-    do_sample: Optional[bool] = False
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
+    messages = build_messages(req.input)
+    text_prompt = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
-def _generate_text(user_text: str, max_new_tokens: int,
-                   do_sample: bool, temperature: float, top_p: float) -> str:
-    _ensure_model_loaded()
+    # Prepare inputs
+    inputs = processor(text=[text_prompt], return_tensors="pt")
+    # Move to device/dtype carefully (Qwen2-VL expects inputs on same device as model)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    # Solo texto del usuario (sin prefijos)
-    messages = [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
-    prompt = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    gen_kwargs = dict(
+        max_new_tokens=req.max_new_tokens or 128,
+    )
+    # Optional decoding settings
+    if req.temperature is not None:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = req.temperature
+    if req.top_p is not None:
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["top_p"] = req.top_p
 
-    inputs = _processor(text=[prompt], return_tensors="pt")
-    if "input_ids" in inputs:
-        inputs["input_ids"] = inputs["input_ids"].to(_model.device)
-    if "attention_mask" in inputs:
-        inputs["attention_mask"] = inputs["attention_mask"].to(_model.device)
-
-    gen_kwargs: Dict[str, Any] = {"max_new_tokens": max_new_tokens}
-    if do_sample:
-        gen_kwargs.update({"do_sample": True, "temperature": float(temperature), "top_p": float(top_p)})
-
+    # Generate
     with torch.inference_mode():
-        out_ids = _model.generate(**inputs, **gen_kwargs)
+        out = model.generate(**inputs, **gen_kwargs)
 
-    # Extraer solo lo generado (sin el prompt)
-    input_len = inputs["input_ids"].shape[-1]
-    gen_ids = out_ids[0, input_len:]
-    text = _processor.batch_decode(gen_ids.unsqueeze(0), skip_special_tokens=True)[0].strip()
+    # Decode
+    decoded = processor.batch_decode(out, skip_special_tokens=True)[0]
 
-    if text.startswith("assistant\n"):
-        text = text[len("assistant\n"):].strip()
-    return text
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-# Devuelve string plano (text/plain)
-@app.post("/generate")
-def generate(entrada: Entrada, authorization: Optional[str] = Header(default=None)):
-    try:
-        _require_bearer(authorization)
-        out = _generate_text(
-            user_text=entrada.texto,
-            max_new_tokens=entrada.max_new_tokens or MAX_NEW_TOKENS,
-            do_sample=bool(entrada.do_sample),
-            temperature=float(entrada.temperature or 0.7),
-            top_p=float(entrada.top_p or 0.9),
-        )
-        return Response(out, media_type="text/plain")
-    except Exception as e:
-        return Response(f"ERROR: {type(e).__name__}: {e}", media_type="text/plain", status_code=500)
+    # Some Qwen chat templates include the prompt + assistant text; we’ll try to trim after the last 'assistant' marker if present.
+    # If the full text is fine for you, you can just return `decoded`.
+    # Below is a minimal, safe approach that returns the full decoded string.
+    return EvalResponse(output=decoded, tokens_generated=int(out[0].shape[-1]))
