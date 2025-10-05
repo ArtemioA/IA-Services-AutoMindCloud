@@ -1,4 +1,4 @@
-# Dockerfile — CPU, modelo horneado (versión limpia)
+# Dockerfile — CPU, modelo horneado (sin heredoc)
 FROM python:3.11-slim
 
 # 1) Dependencias del sistema
@@ -21,21 +21,8 @@ RUN pip install --no-cache-dir \
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
 
-# 5) Descarga (horneado) del modelo a /models
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-import os
-repo = "Qwen/Qwen2-VL-2B-Instruct"
-target = "/models/Qwen2-VL-2B-Instruct"
-print(f"Descargando {repo} -> {target}")
-snapshot_download(
-    repo_id=repo,
-    local_dir=target,
-    local_dir_use_symlinks=False,
-    token=os.environ.get("HF_TOKEN") or None
-)
-print("✅ Modelo descargado en", target)
-PY
+# 5) Descarga (horneado) del modelo a /models (sin heredoc)
+RUN python -c "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id='Qwen/Qwen2-VL-2B-Instruct', local_dir='/models/Qwen2-VL-2B-Instruct', local_dir_use_symlinks=False, token=(os.environ.get('HF_TOKEN') or None)); print('✅ Modelo descargado en /models/Qwen2-VL-2B-Instruct')"
 
 # 6) Copiar la app
 WORKDIR /app
@@ -48,4 +35,4 @@ ENV HF_HOME=/tmp/hf \
     MODEL_DIR=/models/Qwen2-VL-2B-Instruct
 
 EXPOSE 8080
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8080"]
