@@ -1,51 +1,25 @@
-# ============================================================
-# Dockerfile — Cloud Run (Qwen2-VL CPU, FastBoot)
-# ============================================================
-
-# Base: lightweight Python with pip
+# Dockerfile — Cloud Run (Qwen2-VL CPU)
 FROM python:3.11-slim
 
-# Disable Python buffering for better Cloud Run logs
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
 
-# Working directory inside container
 WORKDIR /app
 
-# ------------------------------------------------------------
-# System deps: git, wget (needed by HF Hub)
-# ------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget && \
+# System tiny base (optional but handy)
+RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------------
-# Install core dependencies
-# ------------------------------------------------------------
-RUN pip install --no-cache-dir \
-    fastapi uvicorn pydantic \
-    torch transformers==4.44.0 \
-    accelerate safetensors \
-    huggingface-hub
+# Install Python deps from your requirements.txt
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Enable Hugging Face optimized file transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER=1
-
-# ------------------------------------------------------------
-# Copy application files
-# ------------------------------------------------------------
+# App code
 COPY main.py /app/
 
-# (Optional) if you have a start.sh script — else skip
-# COPY start.sh /app/
-# RUN chmod +x /app/start.sh
-
-# ------------------------------------------------------------
-# Cloud Run reads PORT from env
-# ------------------------------------------------------------
+# Cloud Run port
 ENV PORT=8080
 EXPOSE 8080
 
-# ------------------------------------------------------------
-# Entry point (use python -m to ensure correct path)
-# ------------------------------------------------------------
+# Launch
 CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
