@@ -1,10 +1,10 @@
-# Dockerfile — CPU, modelo horneado (sin heredoc)
+# Dockerfile — Qwen2-VL API (modelo horneado, CPU)
 FROM python:3.11-slim
 
 # 1) Dependencias del sistema
 RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
-# 2) Caches solo durante build
+# 2) Caches solo durante el build (para no descargar el modelo cada vez)
 ENV HF_HOME=/models_cache \
     TRANSFORMERS_CACHE=/models_cache/transformers \
     HUGGINGFACE_HUB_CACHE=/models_cache/hub \
@@ -17,22 +17,27 @@ RUN pip install --no-cache-dir \
     timm==0.9.16 einops tiktoken \
     torch==2.3.1 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# 4) Token opcional para evitar 429 durante el build
+# 4) (Opcional) Token para evitar 429 durante el build
 ARG HF_TOKEN
 ENV HF_TOKEN=${HF_TOKEN}
 
-# 5) Descarga (horneado) del modelo a /models (sin heredoc)
-RUN python -c "from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id='Qwen/Qwen2-VL-2B-Instruct', local_dir='/models/Qwen2-VL-2B-Instruct', local_dir_use_symlinks=False, token=(os.environ.get('HF_TOKEN') or None)); print('✅ Modelo descargado en /models/Qwen2-VL-2B-Instruct')"
+# 5) Descargar el modelo y dejarlo horneado dentro de la imagen
+RUN mkdir -p /models/Qwen2-VL-2B-Instruct && \
+    python -c "from huggingface_hub import snapshot_download; import os; repo='Qwen/Qwen2-VL-2B-Instruct'; target='/models/Qwen2-VL-2B-Instruct'; snapshot_download(repo_id=repo, local_dir=target, local_dir_use_symlinks=False, token=os.environ.get('HF_TOKEN') or None); print('✅ Modelo descargado en', target)" && \
+    ls -lh /models/Qwen2-VL-2B-Instruct
 
-# 6) Copiar la app
+# 6) Copiar el backend FastAPI
 WORKDIR /app
 COPY main.py /app/main.py
 
-# 7) Variables de entorno para runtime
+# 7) Variables de entorno para el runtime
 ENV HF_HOME=/tmp/hf \
     TRANSFORMERS_CACHE=/tmp/hf/transformers \
     HUGGINGFACE_HUB_CACHE=/tmp/hf/hub \
     MODEL_DIR=/models/Qwen2-VL-2B-Instruct
 
 EXPOSE 8080
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8080"]
+
+# 8) Ejecutar FastAPI con Uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
