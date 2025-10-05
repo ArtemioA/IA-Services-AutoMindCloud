@@ -1,6 +1,5 @@
-# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU) 
+# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, compatible)
 import os, socket, threading
-from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -26,7 +25,7 @@ state = {
     "model_dir": MODEL_DIR,
 }
 _lock = threading.Lock()
-_model = {"proc": None, "model": None, "tokenizer": None}
+_model = {"proc": None, "model": None}
 
 app = FastAPI(title="Qwen2-VL (baked)")
 
@@ -52,7 +51,7 @@ def _download_if_needed():
         repo_id=MODEL_REPO,
         local_dir=MODEL_DIR,
         local_dir_use_symlinks=False,
-        # si necesitas token privado: use_auth_token=os.getenv("HUGGINGFACE_HUB_TOKEN")
+        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
     )
 
 def _load_model_locked():
@@ -67,18 +66,24 @@ def _load_model_locked():
     try:
         _download_if_needed()
 
-        # Import tardío (acorta el boot)
+        # Import tardío
         import torch
-        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+        from transformers import AutoProcessor, AutoModelForCausalLM
 
         torch.set_num_threads(1)
-        device = "cpu"  # Cloud Run sin GPU
 
-        proc = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            MODEL_DIR, torch_dtype=torch.float32, device_map=None
+        # Carga 100% local (ya descargado si hacía falta)
+        proc = AutoProcessor.from_pretrained(
+            MODEL_DIR, trust_remote_code=True, local_files_only=True
         )
-        model.eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_DIR,
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        model.to("cpu").eval()
 
         _model["proc"] = proc
         _model["model"] = model
@@ -135,36 +140,33 @@ def generate(body: Ask):
     proc = _model["proc"]
     model = _model["model"]
 
-    # Para Qwen2-VL sin imagen: prompt textual simple
-    prompt = body.prompt.strip()
+    prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=422, detail="prompt vacío")
 
     try:
-        # Formato mínimo para Qwen2-VL en modo texto
-        # (usa AutoProcessor para tokenizar)
-        inputs = proc(
-            text=prompt,
-            return_tensors="pt",
-        )
-
-        # Qwen2-VL usa generate en el modelo VL
         import torch
+
+        # Entrada textual simple (sin imagen)
+        inputs = proc(text=prompt, return_tensors="pt")
+
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
                 max_new_tokens=128,
                 do_sample=False,
                 temperature=0.0,
-                eos_token_id=proc.tokenizer.eos_token_id if hasattr(proc, "tokenizer") else None,
+                eos_token_id=getattr(proc, "tokenizer", None).eos_token_id
+                    if hasattr(proc, "tokenizer") else None,
             )
+
         # Decodificar
-        if hasattr(proc, "tokenizer"):
+        if hasattr(proc, "tokenizer") and proc.tokenizer is not None:
             text = proc.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         else:
-            # respaldo por si el processor no expone tokenizer
+            # respaldo si el processor no expone tokenizer
             from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+            tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True, local_files_only=True)
             text = tok.decode(output_ids[0], skip_special_tokens=True)
 
         return {"ok": True, "text": text}
@@ -176,4 +178,3 @@ def generate(body: Ask):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
