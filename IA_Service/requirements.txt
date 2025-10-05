@@ -1,11 +1,16 @@
-fastapi
-uvicorn[standard]
-torch>=2.3.0
-transformers
-accelerate
-pillow
-torchvision>=0.18.0
-safetensors>=0.4.2
-huggingface_hub>=0.23.0
-pydantic>=2.7
-requests>=2.31
+# --- web ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+requests==2.32.3
+
+# --- core ML (CPU) ---
+torch==2.3.1           # rueda manylinux estable
+transformers==4.43.3   # compatible con Qwen2-VL
+huggingface_hub==0.24.6
+accelerate==0.33.0
+safetensors==0.4.3
+tokenizers==0.19.1
+sentencepiece==0.2.0
+pillow==10.4.0
+numpy==1.26.4
