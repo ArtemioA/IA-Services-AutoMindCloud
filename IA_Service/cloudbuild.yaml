@@ -4,14 +4,15 @@ steps:
       - --destination=$_IMAGE
       - --cache=false
       - --use-new-run
+      - --snapshotMode=redo        # ↓ menor uso de RAM al “tomar snapshot”
       - --verbosity=info
-
 options:
-  machineType: E2_HIGHCPU_8
-  diskSizeGb: 100
+  machineType: E2_HIGHMEM_8        # 8 vCPU / 64 GB RAM
+  diskSizeGb: 200
 timeout: "3600s"
 images:
   - $_IMAGE
 substitutions:
   _IMAGE: us-docker.pkg.dev/api-colab-demo/gcr.io/qwen2vl:baked
+
 
