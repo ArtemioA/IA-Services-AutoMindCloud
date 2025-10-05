@@ -1,4 +1,4 @@
-# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, compatible)
+# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, FIXED)
 import os, socket, threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -27,7 +27,7 @@ state = {
 _lock = threading.Lock()
 _model = {"proc": None, "model": None}
 
-app = FastAPI(title="Qwen2-VL (baked)")
+app = FastAPI(title="Qwen2-VL (CPU)")
 
 class Ask(BaseModel):
     prompt: str
@@ -66,22 +66,20 @@ def _load_model_locked():
     try:
         _download_if_needed()
 
-        # Import tardío
+        # Import tardío — usar las clases correctas de Qwen2-VL
         import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
         torch.set_num_threads(1)
 
-        # Carga 100% local (ya descargado si hacía falta)
         proc = AutoProcessor.from_pretrained(
             MODEL_DIR, trust_remote_code=True, local_files_only=True
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
             MODEL_DIR,
             trust_remote_code=True,
             local_files_only=True,
             torch_dtype=torch.float32,
-            low_cpu_mem_usage=True,
         )
         model.to("cpu").eval()
 
@@ -116,9 +114,9 @@ def root():
         "error": state["error"],
     }
 
-@app.get("/healthz", summary="Healthz", description="Endpoint para verificar estado de carga")
+@app.get("/healthz", summary="Healthz")
 def healthz():
-    # No forza descarga; solo indica si ya está listo
+    # No fuerza descarga; solo indica si ya está listo
     return {"ok": True, "ready": state["ready"], "error": state["error"]}
 
 @app.get("/_dns", summary="Dns Check")
@@ -129,16 +127,12 @@ def dns_check():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-@app.post("/generate", summary="Generate", description="Genera texto a partir de un prompt")
+@app.post("/generate", summary="Generate", description="Genera texto a partir de un prompt (sin imagen)")
 def generate(body: Ask):
-    # Forzamos load perezoso (Descarga si hace falta y luego carga)
     try:
         _ensure_loaded()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load error: {e}")
-
-    proc = _model["proc"]
-    model = _model["model"]
 
     prompt = (body.prompt or "").strip()
     if not prompt:
@@ -146,8 +140,10 @@ def generate(body: Ask):
 
     try:
         import torch
+        proc = _model["proc"]
+        model = _model["model"]
 
-        # Entrada textual simple (sin imagen)
+        # Texto puro
         inputs = proc(text=prompt, return_tensors="pt")
 
         with torch.no_grad():
@@ -156,17 +152,16 @@ def generate(body: Ask):
                 max_new_tokens=128,
                 do_sample=False,
                 temperature=0.0,
-                eos_token_id=getattr(proc, "tokenizer", None).eos_token_id
-                    if hasattr(proc, "tokenizer") else None,
             )
 
-        # Decodificar
-        if hasattr(proc, "tokenizer") and proc.tokenizer is not None:
-            text = proc.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        else:
-            # respaldo si el processor no expone tokenizer
-            from transformers import AutoTokenizer
-            tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True, local_files_only=True)
+        # Decodificación preferente vía processor
+        try:
+            text = proc.batch_decode(output_ids, skip_special_tokens=True)[0]
+        except Exception:
+            tok = getattr(proc, "tokenizer", None)
+            if tok is None:
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True, local_files_only=True)
             text = tok.decode(output_ids[0], skip_special_tokens=True)
 
         return {"ok": True, "text": text}
