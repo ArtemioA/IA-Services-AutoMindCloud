@@ -13,7 +13,7 @@ ENV HF_HOME=/models_cache \
 # 3) Librerías necesarias (CPU)
 RUN pip install --no-cache-dir \
     fastapi uvicorn[standard] pydantic==2.* \
-    transformers==4.44.2 huggingface_hub==0.23.5 pillow==10.* \
+    transformers==4.56.2 huggingface_hub==0.23.5 pillow==10.* \
     timm==0.9.16 einops tiktoken \
     torch==2.3.1 --extra-index-url https://download.pytorch.org/whl/cpu
 
