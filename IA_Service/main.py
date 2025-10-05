@@ -1,5 +1,5 @@
 # main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, FIXED+ONLINE FALLBACK)
-import os, socket, threading
+import os, socket, threading, time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -18,114 +18,119 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 # Descargas más rápidas/robustas desde Hugging Face
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
+app = FastAPI(title="Qwen2-VL (CPU)")
+
 # ---- Estado global ----
-state = {
+_state = {
     "ready": False,
     "loading": False,
     "error": None,
     "model_repo": MODEL_REPO,
     "model_dir": MODEL_DIR,
+    "device": "cpu",
+    "t0": time.time(),
 }
 _lock = threading.Lock()
 _model = {"proc": None, "model": None}
 
-app = FastAPI(title="Qwen2-VL (CPU)")
-
 class Ask(BaseModel):
     prompt: str
+    max_new_tokens: int | None = 128
+    temperature: float | None = 0.0  # greedy por defecto (CPU estable)
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-def _download_if_needed():
-    """
-    Si MODEL_DIR no existe o está vacío y ALLOW_DOWNLOAD=1, descarga el repo de HF.
-    Nota: Ya no dependemos estrictamente de esto, porque _load_model_locked()
-    permite cargar online si local no existe. Mantener para 'hornear' en /tmp si quieres.
-    """
-    has_local = os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
-    if has_local:
-        return
-    if not ALLOW_DL:
-        raise RuntimeError(f"Model directory not found: {MODEL_DIR} (ALLOW_DOWNLOAD=0)")
-    from huggingface_hub import snapshot_download
-    _ensure_dir(MODEL_DIR)
-    snapshot_download(
-        repo_id=MODEL_REPO,
-        local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,
-        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
-    )
+def _has_local_model() -> bool:
+    return os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
 
 def _load_model_locked():
     """
     Carga perezosa (idempotente y thread-safe).
     Prefiere snapshot local si existe; si no, carga online desde MODEL_REPO.
     """
-    if state["ready"] or state["loading"]:
+    if _state["ready"] or _state["loading"]:
         return
 
-    state["loading"] = True
-    state["error"] = None
+    _state["loading"] = True
+    _state["error"] = None
     try:
         import torch
         from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
         torch.set_num_threads(1)
+        _state["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
-        use_local = os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
+        use_local = _has_local_model()
+        if not use_local and not ALLOW_DL:
+            raise RuntimeError(f"Model directory not found: {MODEL_DIR} (ALLOW_DOWNLOAD=0)")
+
         src = MODEL_DIR if use_local else MODEL_REPO
-
-        # Si quieres además predescargar a /tmp, descomenta:
-        # _download_if_needed(); src = MODEL_DIR
 
         proc = AutoProcessor.from_pretrained(
             src,
             trust_remote_code=True,
-            local_files_only=False,   # <-- permite completar online si falta algo
+            local_files_only=False,   # permite completar online si falta algo
         )
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             src,
             trust_remote_code=True,
-            local_files_only=False,   # <-- idem
-            torch_dtype=torch.float32,
+            local_files_only=False,
+            torch_dtype=torch.float32,  # CPU friendly
         ).to("cpu").eval()
 
         _model["proc"] = proc
         _model["model"] = model
-
-        state["ready"] = True
+        _state["ready"] = True
     except Exception as e:
-        state["error"] = f"{type(e).__name__}: {e}"
-        raise
+        _state["error"] = f"{type(e).__name__}: {e}"
     finally:
-        state["loading"] = False
+        _state["loading"] = False
 
-def _ensure_loaded():
-    if state["ready"]:
+def _ensure_loaded_bg():
+    # dispara carga en background (no bloquea)
+    if _state["ready"] or _state["loading"]:
+        return
+    def _bg():
+        with _lock:
+            if not _state["ready"]:
+                _load_model_locked()
+    threading.Thread(target=_bg, daemon=True).start()
+
+def _ensure_loaded_blocking():
+    # bloquea hasta intentar la carga (para /generate)
+    if _state["ready"]:
         return
     with _lock:
-        if state["ready"]:
-            return
-        _load_model_locked()
+        if not _state["ready"]:
+            _load_model_locked()
 
 # ---------------- Endpoints ----------------
 
 @app.get("/")
 def root():
+    _ensure_loaded_bg()
     return {
         "ok": True,
-        "status": "ready" if state["ready"] else ("loading" if state["loading"] else "cold"),
-        "device": "cpu",
-        "model_dir": state["model_dir"],
-        "model_repo": state["model_repo"],
-        "error": state["error"],
+        "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
+        "device": _state["device"],
+        "model_dir": _state["model_dir"],
+        "model_repo": _state["model_repo"],
+        "uptime_s": round(time.time() - _state["t0"], 1),
+        "error": _state["error"],
+        "allow_download": ALLOW_DL,
     }
 
-@app.get("/healthz", summary="Healthz")
+@app.get("/status", summary="Status (dispara warm-up)")
+def status():
+    _ensure_loaded_bg()
+    return {
+        "ok": True,
+        "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
+        "error": _state["error"],
+    }
+
+@app.get("/healthz", summary="Healthz (no fuerza descarga)")
 def healthz():
-    # No fuerza descarga; solo indica si ya está listo
-    return {"ok": True, "ready": state["ready"], "error": state["error"]}
+    # No fuerza descarga; útil para probes rápidos
+    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
 
 @app.get("/_dns", summary="Dns Check")
 def dns_check():
@@ -138,9 +143,16 @@ def dns_check():
 @app.post("/generate", summary="Generate", description="Genera texto a partir de un prompt (sin imagen)")
 def generate(body: Ask):
     try:
-        _ensure_loaded()
+        _ensure_loaded_blocking()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Load error: {e}")
+
+    if not _state["ready"]:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model not ready. status="
+                   f"{'loading' if _state['loading'] else 'cold'}; error={_state['error']}"
+        )
 
     prompt = (body.prompt or "").strip()
     if not prompt:
@@ -151,29 +163,26 @@ def generate(body: Ask):
         proc = _model["proc"]
         model = _model["model"]
 
-        # Texto puro
-        inputs = proc(text=prompt, return_tensors="pt")
+        inputs = proc(text=[prompt], return_tensors="pt")
 
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-                temperature=0.0,
+                max_new_tokens=int(body.max_new_tokens or 128),
+                do_sample=(body.temperature or 0.0) > 0.0,
+                temperature=float(body.temperature or 0.0),
             )
 
-        # Decodificación preferente vía processor
-        try:
+        # Decodificación
+        text = None
+        if hasattr(proc, "batch_decode"):
             text = proc.batch_decode(output_ids, skip_special_tokens=True)[0]
-        except Exception:
+        else:
             tok = getattr(proc, "tokenizer", None)
             if tok is None:
                 from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained(
-                    MODEL_DIR if os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR)) else MODEL_REPO,
-                    trust_remote_code=True,
-                    local_files_only=False
-                )
+                src = MODEL_DIR if _has_local_model() else MODEL_REPO
+                tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True, local_files_only=False)
             text = tok.decode(output_ids[0], skip_special_tokens=True)
 
         return {"ok": True, "text": text}
