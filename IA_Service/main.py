@@ -1,142 +1,179 @@
-# main.py — Qwen2-VL horneado (Cloud Run listo y probado)
-import os, threading, time
+# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU)
+import os, socket, threading
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import torch
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-app = FastAPI(title="Qwen2-VL (baked)")
+# ---- Config (por env) ----
+MODEL_REPO  = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
+MODEL_DIR   = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")
+ALLOW_DL    = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
+PORT        = int(os.environ.get("PORT", "8080"))
 
-# --- Configuración básica ---
-MODEL_DIR = os.environ.get("MODEL_DIR", "/models/Qwen2-VL-2B-Instruct")
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "128"))
-
-# Caches volátiles (no descarga nada en runtime)
+# Caches en /tmp (Cloud Run los permite escribir)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
-
-# Limitar threads en CPU
-torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-_state = {
+# ---- Estado global ----
+state = {
     "ready": False,
+    "loading": False,
     "error": None,
-    "device": "cpu",
-    "processor": None,
-    "model": None
+    "model_repo": MODEL_REPO,
+    "model_dir": MODEL_DIR,
 }
 _lock = threading.Lock()
+_model = {"proc": None, "model": None, "tokenizer": None}
+
+app = FastAPI(title="Qwen2-VL (baked)")
 
 class Ask(BaseModel):
     prompt: str
 
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
 
-# --- Carga perezosa del modelo local horneado ---
-def _lazy_load():
+def _download_if_needed():
+    """
+    Si MODEL_DIR no existe o está vacío y ALLOW_DOWNLOAD=1, descarga el repo de HF.
+    """
+    if os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR)):
+        return  # ya hay archivos
+
+    if not ALLOW_DL:
+        raise RuntimeError(f"Model directory not found: {MODEL_DIR} (ALLOW_DOWNLOAD=0)")
+
+    from huggingface_hub import snapshot_download
+    _ensure_dir(MODEL_DIR)
+    snapshot_download(
+        repo_id=MODEL_REPO,
+        local_dir=MODEL_DIR,
+        local_dir_use_symlinks=False,
+        # si necesitas token privado: use_auth_token=os.getenv("HUGGINGFACE_HUB_TOKEN")
+    )
+
+def _load_model_locked():
+    """
+    Carga perezosa (idempotente y thread-safe).
+    """
+    if state["ready"] or state["loading"]:
+        return
+
+    state["loading"] = True
+    state["error"] = None
+    try:
+        _download_if_needed()
+
+        # Import tardío (acorta el boot)
+        import torch
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+        torch.set_num_threads(1)
+        device = "cpu"  # Cloud Run sin GPU
+
+        proc = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            MODEL_DIR, torch_dtype=torch.float32, device_map=None
+        )
+        model.eval()
+
+        _model["proc"] = proc
+        _model["model"] = model
+
+        state["ready"] = True
+    except Exception as e:
+        state["error"] = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        state["loading"] = False
+
+def _ensure_loaded():
+    if state["ready"]:
+        return
     with _lock:
-        if _state["ready"] or _state["error"]:
+        if state["ready"]:
             return
-        try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            _state["device"] = device
+        _load_model_locked()
 
-            # ✅ Cargar modelo desde ruta local absoluta
-            model_path = os.path.abspath(MODEL_DIR)
-            print(f"🔍 Loading local model from: {model_path}")
-            if not os.path.isdir(model_path):
-                raise RuntimeError(f"Model directory not found: {model_path}")
+# ---------------- Endpoints ----------------
 
-            proc = AutoProcessor.from_pretrained(
-                pretrained_model_name_or_path=model_path,
-                local_files_only=True,
-                trust_remote_code=True
-            )
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path=model_path,
-                local_files_only=True,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-
-            model.to("cpu").eval()
-            _state["processor"] = proc
-            _state["model"] = model
-            _state["ready"] = True
-            print("✅ Modelo cargado correctamente.")
-        except Exception as e:
-            _state["error"] = f"{type(e).__name__}: {e}"
-            print(f"❌ Error al cargar modelo: {_state['error']}")
-
-
-# --- Rutas FastAPI ---
 @app.get("/")
 def root():
-    # Inicia carga si aún no está listo
-    if not _state["ready"] and not _state["error"]:
-        threading.Thread(target=_lazy_load, daemon=True).start()
     return {
         "ok": True,
-        "status": "ready" if _state["ready"] else ("error" if _state["error"] else "starting"),
-        "device": _state["device"],
-        "model_dir": MODEL_DIR,
-        "error": _state["error"]
+        "status": "ready" if state["ready"] else ("loading" if state["loading"] else "cold"),
+        "device": "cpu",
+        "model_dir": state["model_dir"],
+        "model_repo": state["model_repo"],
+        "error": state["error"],
     }
 
-
-@app.get("/healthz")
+@app.get("/healthz", summary="Healthz", description="Endpoint para verificar estado de carga")
 def healthz():
-    """Endpoint para verificar estado de carga"""
-    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
+    # No forza descarga; solo indica si ya está listo
+    return {"ok": True, "ready": state["ready"], "error": state["error"]}
 
-
-@app.post("/generate")
-def generate(q: Ask):
-    """Genera texto a partir de un prompt"""
-    if not _state["ready"]:
-        if _state["error"]:
-            raise HTTPException(500, f"Load error: {_state['error']}")
-        _lazy_load()
-        # espera breve (hasta ~5s) por la carga inicial
-        for _ in range(50):
-            if _state["ready"] or _state["error"]:
-                break
-            time.sleep(0.1)
-        if not _state["ready"]:
-            if _state["error"]:
-                raise HTTPException(500, f"Load error: {_state['error']}")
-            raise HTTPException(503, "Model loading, try again shortly.")
-
-    proc = _state["processor"]
-    model = _state["model"]
-
-    # --- Generación simple ---
-    inputs = proc(text=q.prompt, return_tensors="pt")
-    with torch.inference_mode():
-        tokens = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS)
-    text = proc.batch_decode(tokens, skip_special_tokens=True)[0]
-
-    return {"ok": True, "text": text}
-
-
-# --- Diagnóstico DNS (opcional) ---
-@app.get("/_dns")
+@app.get("/_dns", summary="Dns Check")
 def dns_check():
-    import socket
-    hosts = ["huggingface.co", "cdn-lfs.huggingface.co", "google.com"]
-    out = {}
-    for h in hosts:
-        try:
-            out[h] = [ai[4][0] for ai in socket.getaddrinfo(h, 443)]
-        except Exception as e:
-            out[h] = f"ERROR: {e}"
-    return out
+    try:
+        host = socket.gethostbyname("huggingface.co")
+        return {"ok": True, "host": host}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/generate", summary="Generate", description="Genera texto a partir de un prompt")
+def generate(body: Ask):
+    # Forzamos load perezoso (Descarga si hace falta y luego carga)
+    try:
+        _ensure_loaded()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Load error: {e}")
+
+    proc = _model["proc"]
+    model = _model["model"]
+
+    # Para Qwen2-VL sin imagen: prompt textual simple
+    prompt = body.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=422, detail="prompt vacío")
+
+    try:
+        # Formato mínimo para Qwen2-VL en modo texto
+        # (usa AutoProcessor para tokenizar)
+        inputs = proc(
+            text=prompt,
+            return_tensors="pt",
+        )
+
+        # Qwen2-VL usa generate en el modelo VL
+        import torch
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,
+                temperature=0.0,
+                eos_token_id=proc.tokenizer.eos_token_id if hasattr(proc, "tokenizer") else None,
+            )
+        # Decodificar
+        if hasattr(proc, "tokenizer"):
+            text = proc.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        else:
+            # respaldo por si el processor no expone tokenizer
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+            text = tok.decode(output_ids[0], skip_special_tokens=True)
+
+        return {"ok": True, "text": text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"inference error: {type(e).__name__}: {e}")
 
 
-# --- Entrada principal (para pruebas locales) ---
+# ------------- Run local (no usado en Cloud Run) -------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
+
