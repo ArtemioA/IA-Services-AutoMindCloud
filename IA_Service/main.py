@@ -1,4 +1,4 @@
-# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU)
+# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU) 
 import os, socket, threading
 from typing import Optional
 from fastapi import FastAPI, HTTPException
