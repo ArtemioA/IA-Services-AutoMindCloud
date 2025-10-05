@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 torch>=2.3.0
-transformers
+transformers=4.56.2
 accelerate
 pillow
 torchvision>=0.18.0
