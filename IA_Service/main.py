@@ -1,4 +1,4 @@
-# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, FIXED)
+# main.py — Cloud Run (lazy download + lazy load, Qwen2-VL CPU, FIXED+ONLINE FALLBACK)
 import os, socket, threading
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -15,6 +15,8 @@ os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Descargas más rápidas/robustas desde Hugging Face
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 # ---- Estado global ----
 state = {
@@ -38,13 +40,14 @@ def _ensure_dir(path: str):
 def _download_if_needed():
     """
     Si MODEL_DIR no existe o está vacío y ALLOW_DOWNLOAD=1, descarga el repo de HF.
+    Nota: Ya no dependemos estrictamente de esto, porque _load_model_locked()
+    permite cargar online si local no existe. Mantener para 'hornear' en /tmp si quieres.
     """
-    if os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR)):
-        return  # ya hay archivos
-
+    has_local = os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
+    if has_local:
+        return
     if not ALLOW_DL:
         raise RuntimeError(f"Model directory not found: {MODEL_DIR} (ALLOW_DOWNLOAD=0)")
-
     from huggingface_hub import snapshot_download
     _ensure_dir(MODEL_DIR)
     snapshot_download(
@@ -57,6 +60,7 @@ def _download_if_needed():
 def _load_model_locked():
     """
     Carga perezosa (idempotente y thread-safe).
+    Prefiere snapshot local si existe; si no, carga online desde MODEL_REPO.
     """
     if state["ready"] or state["loading"]:
         return
@@ -64,24 +68,28 @@ def _load_model_locked():
     state["loading"] = True
     state["error"] = None
     try:
-        _download_if_needed()
-
-        # Import tardío — usar las clases correctas de Qwen2-VL
         import torch
         from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
         torch.set_num_threads(1)
 
+        use_local = os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR))
+        src = MODEL_DIR if use_local else MODEL_REPO
+
+        # Si quieres además predescargar a /tmp, descomenta:
+        # _download_if_needed(); src = MODEL_DIR
+
         proc = AutoProcessor.from_pretrained(
-            MODEL_DIR, trust_remote_code=True, local_files_only=True
+            src,
+            trust_remote_code=True,
+            local_files_only=False,   # <-- permite completar online si falta algo
         )
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            MODEL_DIR,
+            src,
             trust_remote_code=True,
-            local_files_only=True,
+            local_files_only=False,   # <-- idem
             torch_dtype=torch.float32,
-        )
-        model.to("cpu").eval()
+        ).to("cpu").eval()
 
         _model["proc"] = proc
         _model["model"] = model
@@ -161,7 +169,11 @@ def generate(body: Ask):
             tok = getattr(proc, "tokenizer", None)
             if tok is None:
                 from transformers import AutoTokenizer
-                tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True, local_files_only=True)
+                tok = AutoTokenizer.from_pretrained(
+                    MODEL_DIR if os.path.isdir(MODEL_DIR) and any(os.scandir(MODEL_DIR)) else MODEL_REPO,
+                    trust_remote_code=True,
+                    local_files_only=False
+                )
             text = tok.decode(output_ids[0], skip_special_tokens=True)
 
         return {"ok": True, "text": text}
