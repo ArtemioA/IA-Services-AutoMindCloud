@@ -7,7 +7,7 @@ steps:
       - --verbosity=info
 options:
   machineType: E2_HIGHCPU_8
-  diskSizeGb: 200
+  diskSizeGb: 100
 timeout: "3600s"
 images:
   - $_FULL_TAG
