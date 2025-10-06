@@ -61,7 +61,7 @@ def _download_if_needed():
         repo_id=MODEL_REPO,
         local_dir=MODEL_DIR,
         local_dir_use_symlinks=False,
-        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
+        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,  # si no hay token, va público
     )
 
 def _choose_src():
@@ -69,14 +69,14 @@ def _choose_src():
     Decide la fuente de carga:
       - Si hay snapshot local válido -> usar carpeta local.
       - Si no hay y ALLOW_DL y MODEL_DIR definido -> descargar y usar carpeta.
-      - Si no, usar repo online (requiere egress y/o token).
+      - Si no, usar repo online (requiere egress; token opcional).
     """
     use_local = _has_local_snapshot(MODEL_DIR)
     if not use_local and ALLOW_DL and MODEL_DIR:
         try:
             _download_if_needed()
             use_local = _has_local_snapshot(MODEL_DIR)
-        except Exception as _e:
+        except Exception:
             # Si falla la descarga, caeremos a repo online.
             pass
     return (MODEL_DIR if use_local else MODEL_REPO), use_local
@@ -102,7 +102,7 @@ def _load_model_locked():
         local_only = (not ALLOW_DL)  # offline fuerza local-only
 
         # Cargas con trust_remote_code y respetando offline/online
-        token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
+        token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None  # puede ser None
 
         proc = AutoProcessor.from_pretrained(
             src, trust_remote_code=True, local_files_only=local_only, token=token
