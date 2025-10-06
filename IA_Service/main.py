@@ -1,4 +1,4 @@
-# main.py — Cloud Run (Qwen2-VL CPU) | Optimizado para modelo pre-descargado
+# main.py — Cloud Run (Qwen2-VL CPU) | Versión online
 import os, socket, threading, time, logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 
 # ---------------- Env config ----------------
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR  = os.environ.get("MODEL_DIR", "/app/models/Qwen2-VL-2B-Instruct")
-ALLOW_DL   = os.environ.get("ALLOW_DOWNLOAD", "0") == "1"
+MODEL_DIR  = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")
+ALLOW_DL   = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
 PORT       = int(os.environ.get("PORT", "8080"))
 
-logger.info(f"🔧 Configuración: MODEL_REPO={MODEL_REPO}, MODEL_DIR={MODEL_DIR}, ALLOW_DL={ALLOW_DL}")
+logger.info(f"🔧 Configuración: MODEL_REPO={MODEL_REPO}, ALLOW_DL={ALLOW_DL}")
 
 # Writable caches (Cloud Run)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
@@ -33,7 +33,6 @@ _state = {
     "loading": False,
     "error": None,
     "model_repo": MODEL_REPO,
-    "model_dir": MODEL_DIR,
     "device": "cpu",
     "mode": "online" if ALLOW_DL else "offline",
     "t0": time.time(),
@@ -41,26 +40,14 @@ _state = {
 _lock = threading.Lock()
 _model = {"proc": None, "tok": None, "model": None}
 
-# ---------------- Helpers ----------------
-def _has_local_snapshot(path: str) -> bool:
-    """Verifica si existe un snapshot local válido."""
-    if not path or not os.path.isdir(path):
-        logger.info(f"🔍 Snapshot local: path '{path}' no es directorio válido")
-        return False
-    
-    config_path = os.path.join(path, "config.json")
-    exists = os.path.exists(config_path)
-    logger.info(f"🔍 Snapshot local: {path} -> {'✅' if exists else '❌'} (config.json: {exists})")
-    return exists
-
+# ---------------- Model loading ----------------
 def _load_model_locked():
-    """Carga el modelo desde el directorio local."""
+    """Carga el modelo desde Hugging Face Hub"""
     if _state["ready"] or _state["loading"]:
-        logger.info("🔄 Modelo ya listo o cargando, omitiendo")
         return
     
     _state["loading"], _state["error"] = True, None
-    logger.info("🚀 Iniciando carga del modelo...")
+    logger.info("🚀 Iniciando carga del modelo desde Hugging Face Hub...")
     
     try:
         import torch
@@ -71,37 +58,34 @@ def _load_model_locked():
         _state["device"] = device
         logger.info(f"⚙️  Dispositivo: {device}")
 
-        # Siempre usar modelo local (pre-descargado en build)
-        if not _has_local_snapshot(MODEL_DIR):
-            error_msg = f"No se encontró modelo local en {MODEL_DIR}"
-            logger.error(f"❌ {error_msg}")
-            _state["error"] = error_msg
-            return
-
-        logger.info(f"📥 Cargando desde directorio local: {MODEL_DIR}")
+        # Cargar desde Hugging Face Hub
+        logger.info(f"📥 Descargando modelo: {MODEL_REPO}")
+        
+        token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        logger.info(f"🔑 Token HF: {'✅ Presente' if token else '❌ No presente (acceso público)'}")
 
         # Cargar componentes
         logger.info("📥 Cargando processor...")
         proc = AutoProcessor.from_pretrained(
-            MODEL_DIR, 
+            MODEL_REPO, 
             trust_remote_code=True, 
-            local_files_only=True
+            token=token
         )
         logger.info("✅ Processor cargado")
 
         logger.info("📥 Cargando tokenizer...")
         tok = AutoTokenizer.from_pretrained(
-            MODEL_DIR, 
+            MODEL_REPO, 
             trust_remote_code=True, 
-            local_files_only=True
+            token=token
         )
         logger.info("✅ Tokenizer cargado")
 
         logger.info("📥 Cargando modelo...")
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            MODEL_DIR, 
+            MODEL_REPO, 
             trust_remote_code=True, 
-            local_files_only=True,
+            token=token,
             torch_dtype=torch.float32,
         ).to("cpu").eval()
         logger.info("✅ Modelo cargado y en modo evaluación")
@@ -148,7 +132,6 @@ def root():
         "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
         "device": _state["device"],
         "mode": _state["mode"],
-        "model_dir": _state["model_dir"],
         "model_repo": _state["model_repo"],
         "uptime_s": round(time.time() - _state["t0"], 1),
         "error": _state["error"],
