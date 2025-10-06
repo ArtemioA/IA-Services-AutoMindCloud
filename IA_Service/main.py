@@ -1,4 +1,4 @@
-# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks 
+# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks
 import os, socket, threading, time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -7,6 +7,7 @@ from pydantic import BaseModel
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 MODEL_DIR  = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")  # puede ser vacío
 ALLOW_DL   = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
+FORCE_ONLINE = os.environ.get("FORCE_ONLINE", "0") == "1"  # ignora MODEL_DIR si 1
 PORT       = int(os.environ.get("PORT", "8080"))
 
 # Writable caches (Cloud Run)
@@ -42,14 +43,29 @@ _model = {"proc": None, "tok": None, "model": None}
 
 # ---------------- Helpers ----------------
 def _has_local_snapshot(path: str) -> bool:
-    """Considera 'snapshot válido' solo si existe config.json (evita carpetas vacías)."""
+    """
+    Snapshot válido si:
+      - existe config.json
+      - y existe AL MENOS UN archivo de pesos: *.safetensors o pytorch_model.bin
+        (en la carpeta o subcarpetas)
+    """
     if not path or not os.path.isdir(path):
         return False
-    return os.path.exists(os.path.join(path, "config.json"))
+    if not os.path.exists(os.path.join(path, "config.json")):
+        return False
+
+    # Busca pesos en la carpeta y subcarpetas (evita falsos positivos)
+    for root, _dirs, files in os.walk(path):
+        if "pytorch_model.bin" in files:
+            return True
+        for f in files:
+            if f.endswith(".safetensors"):
+                return True
+    return False
 
 def _download_if_needed():
     """Descarga el repo a MODEL_DIR si está permitido y aún no existe snapshot válido."""
-    if not ALLOW_DL or not MODEL_DIR:
+    if not ALLOW_DL or not MODEL_DIR or FORCE_ONLINE:
         return
     if _has_local_snapshot(MODEL_DIR):
         return
@@ -65,10 +81,14 @@ def _download_if_needed():
 def _choose_src():
     """
     Decide la fuente de carga:
+      - FORCE_ONLINE=1 -> siempre repo online.
       - Si hay snapshot local válido -> usar carpeta local.
-      - Si no hay y ALLOW_DL y MODEL_DIR definido -> descargar y usar carpeta.
+      - Si no hay y ALLOW_DL y MODEL_DIR definido -> descargar y usar carpeta si queda válida.
       - Si no, usar repo online (requiere egress; token opcional).
     """
+    if FORCE_ONLINE:
+        return MODEL_REPO, False
+
     use_local = _has_local_snapshot(MODEL_DIR)
     if not use_local and ALLOW_DL and MODEL_DIR:
         try:
@@ -76,7 +96,7 @@ def _choose_src():
             use_local = _has_local_snapshot(MODEL_DIR)
         except Exception:
             # Si falla la descarga, caeremos a repo online.
-            pass
+            use_local = False
     return (MODEL_DIR if use_local else MODEL_REPO), use_local
 
 # ---------------- Model loading ----------------
@@ -96,8 +116,8 @@ def _load_model_locked():
         torch.set_num_threads(1)
         _state["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
-        src, _using_local = _choose_src()
-        local_only = (not ALLOW_DL)  # offline fuerza local-only
+        src, using_local = _choose_src()
+        local_only = (not ALLOW_DL) or (using_local and not FORCE_ONLINE)
         token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
         proc = AutoProcessor.from_pretrained(
@@ -155,6 +175,7 @@ def root():
         "uptime_s": round(time.time() - _state["t0"], 1),
         "error": _state["error"],
         "allow_download": ALLOW_DL,
+        "force_online": FORCE_ONLINE,
     }
 
 @app.get("/status", summary="Status (warms up)")
