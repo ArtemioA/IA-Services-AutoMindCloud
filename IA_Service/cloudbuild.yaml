@@ -1,26 +1,37 @@
-steps:
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'us-docker.pkg.dev/$PROJECT_ID/qwen2vl/app:$SHORT_SHA', '.']
+substitutions:
+  _REGION: us-central1
+  _SERVICE: qwen2vl-canary
+  _IMAGE: us-docker.pkg.dev/$PROJECT_ID/qwen2vl/app:$SHORT_SHA
 
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+steps:
+  # 1) Build de la imagen
+  - name: gcr.io/kaniko-project/executor:latest
+    args:
+      - --destination=${_IMAGE}
+      - --cache=false
+      - --use-new-run
+      - --snapshotMode=redo
+      - --verbosity=info
+
+  # 2) Deploy a Cloud Run (MISMO pipeline)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
-      - 'run'
-      - 'deploy'
-      - 'qwen2vl-canary'
-      - '--image=us-docker.pkg.dev/$PROJECT_ID/qwen2vl/app:$SHORT_SHA'
-      - '--region=us-central1'
-      - '--allow-unauthenticated'
-      - '--cpu=2'
-      - '--memory=4Gi'
-      - '--timeout=300'
-      - '--max-instances=2'
-      - '--min-instances=0'
-      - '--concurrency=1'
-      - '--set-env-vars=MODEL_DIR=/tmp/models/Qwen2-VL-2B-Instruct,ALLOW_DOWNLOAD=1'
-      - '--command=bash'
-      - '--args=-lc,uvicorn main:app --host 0.0.0.0 --port ${PORT}'
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --allow-unauthenticated
+      - --cpu=2
+      - --memory=4Gi
+      - --timeout=600
+      - --max-instances=2
+      - --min-instances=0
+      - --concurrency=1
+      - --set-env-vars=MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct,ALLOW_DOWNLOAD=1,HF_HOME=/tmp/hf,TRANSFORMERS_CACHE=/tmp/hf/transformers,HUGGINGFACE_HUB_CACHE=/tmp/hf/hub,OMP_NUM_THREADS=1,MKL_NUM_THREADS=1
+      - --command=bash
+      - --args=-lc,uvicorn\ main:app\ --host\ 0.0.0.0\ --port\ ${PORT}
+
 images:
-  - 'us-docker.pkg.dev/$PROJECT_ID/qwen2vl/app:$SHORT_SHA'
-
-
+  - ${_IMAGE}
