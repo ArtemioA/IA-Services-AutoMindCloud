@@ -6,47 +6,56 @@ substitutions:
   _IMAGE_NAME: app
 
 steps:
-  # 1) Build & push imagen (Cloud Build con Docker builder)
+  # 0) Asegura que el repo de Artifact Registry existe (ubicación: us)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        set -e
+        if ! gcloud artifacts repositories describe ${_REPO} --location=us >/dev/null 2>&1; then
+          echo "Creating AR repo '${_REPO}' in location=us..."
+          gcloud artifacts repositories create ${_REPO} \
+            --repository-format=DOCKER \
+            --location=us \
+            --description="Repo Docker para Qwen2-VL"
+        else
+          echo "AR repo '${_REPO}' (us) ok."
+        fi
+
+  # 1) Build
   - name: 'gcr.io/cloud-builders/docker'
     args:
-      - 'build'
-      - '-t'
-      - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
-      - '.'
+      - build
+      - -t
+      - ${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
+      - .
 
+  # 2) Push
   - name: 'gcr.io/cloud-builders/docker'
     args:
-      - 'push'
-      - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+      - push
+      - ${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
 
-  # 2) Deploy a Cloud Run (misma imagen recién construida)
+  # 3) Deploy (todo en args discretos; env vars en una sola cadena, sin espacios)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
-      - 'run'
-      - 'deploy'
-      - '${_SERVICE}'
-      - '--image=${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
-      - '--region=${_REGION}'
-      - '--allow-unauthenticated'
-      - '--cpu=2'
-      - '--memory=4Gi'
-      - '--timeout=600'
-      - '--concurrency=1'
-      - '--min-instances=0'
-      - '--max-instances=2'
-      - >-
-        --set-env-vars=MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct,
-        MODEL_DIR=/tmp/models/Qwen2-VL-2B-Instruct,
-        ALLOW_DOWNLOAD=1,
-        HF_HOME=/tmp/hf,
-        TRANSFORMERS_CACHE=/tmp/hf/transformers,
-        HUGGINGFACE_HUB_CACHE=/tmp/hf/hub,
-        HF_HUB_ENABLE_HF_TRANSFER=1,
-        OMP_NUM_THREADS=1,
-        MKL_NUM_THREADS=1
-      - '--command=bash'
-      - '--args=-lc,uvicorn main:app --host 0.0.0.0 --port ${PORT}'
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
+      - --region=${_REGION}
+      - --allow-unauthenticated
+      - --cpu=2
+      - --memory=4Gi
+      - --timeout=600
+      - --concurrency=1
+      - --min-instances=0
+      - --max-instances=2
+      - --set-env-vars=MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct,MODEL_DIR=/tmp/models/Qwen2-VL-2B-Instruct,ALLOW_DOWNLOAD=1,HF_HOME=/tmp/hf,TRANSFORMERS_CACHE=/tmp/hf/transformers,HUGGINGFACE_HUB_CACHE=/tmp/hf/hub,HF_HUB_ENABLE_HF_TRANSFER=1,OMP_NUM_THREADS=1,MKL_NUM_THREADS=1
+      - --command=bash
+      - --args=-lc,uvicorn\ main:app\ --host\ 0.0.0.0\ --port\ ${PORT}
 
 images:
-  - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+  - ${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}
