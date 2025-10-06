@@ -58,4 +58,4 @@ ENV MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct \
 EXPOSE 8080
 
 # Arranque del servicio
-CMD ["bash", "-lc", "python -m uvico
+CMD ["bash", "-lc", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
