@@ -1,3 +1,4 @@
+# Dockerfile — Qwen2-VL baked/offline (sin Python inline)
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -7,17 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ----- Dependencias -----
+# ===== Dependencias (requiere que requirements.txt tenga huggingface_hub[cli]) =====
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ----- Hornear modelo (sin Python inline) -----
+# ===== Hornear el modelo en la imagen =====
 ARG MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct
 ARG MODEL_REV=main
 ENV MODEL_DIR=/models/Qwen2-VL-2B-Instruct
 RUN mkdir -p "${MODEL_DIR}"
 
-# Trae pesos y configs (soporta layout único o sharded)
+# Descarga robusta: soporta pesos en 1 archivo o shardeados
 RUN huggingface-cli download "${MODEL_REPO}" --revision "${MODEL_REV}" \
     --local-dir "${MODEL_DIR}" --local-dir-use-symlinks False \
     --include "config.json" \
@@ -39,13 +40,15 @@ RUN huggingface-cli download "${MODEL_REPO}" --revision "${MODEL_REV}" \
    || ls "${MODEL_DIR}"/pytorch_model-*.bin 1>/dev/null 2>&1 ) \
  || (echo "❌ No se encontraron pesos en ${MODEL_DIR}"; ls -la "${MODEL_DIR}"; exit 1)
 
-# ----- App -----
+# ===== App =====
 COPY main.py .
 
+# Caches seguros (no deberían usarse si todo está horneado)
 ENV HF_HOME=/tmp/hf \
     TRANSFORMERS_CACHE=/tmp/hf/transformers \
     HUGGINGFACE_HUB_CACHE=/tmp/hf/hub \
     PORT=8080
+
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["bash","-lc","uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
