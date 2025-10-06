@@ -6,7 +6,7 @@ accelerate
 pillow
 torchvision>=0.18.0
 safetensors>=0.4.2
-huggingface_hub >= 0.34.0, < 1.0
+huggingface_hub>=0.25.0
 pydantic>=2.7
 requests>=2.31
 hf-transfer>=0.1.6
