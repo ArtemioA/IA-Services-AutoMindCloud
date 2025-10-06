@@ -22,16 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ARG HUGGINGFACE_HUB_TOKEN
 # ENV HUGGINGFACE_HUB_TOKEN=$HUGGINGFACE_HUB_TOKEN
 
-# ↓↓↓ Hornear snapshot del modelo dentro de la imagen (no depende de CDN en runtime)
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    "Qwen/Qwen2-VL-2B-Instruct",
-    local_dir="/app/models/Qwen2-VL-2B-Instruct",
-    local_dir_use_symlinks=False
-)
-PY
-
+# ↓↓↓ Hornear snapshot del modelo (sin heredoc)
+RUN python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen2-VL-2B-Instruct', local_dir='/app/models/Qwen2-VL-2B-Instruct', local_dir_use_symlinks=False)"
 
 # ---------- Runtime stage: imagen limpia ----------
 FROM python:3.11-slim
@@ -75,4 +68,3 @@ EXPOSE 8080
 
 # Arranque del servicio
 CMD ["sh", "-lc", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
-
