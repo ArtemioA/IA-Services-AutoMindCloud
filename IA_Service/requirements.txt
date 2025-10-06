@@ -1,12 +1,12 @@
 fastapi==0.118.0
 uvicorn[standard]==0.37.0
 torch>=2.3 --index-url https://download.pytorch.org/whl/cu121
-transformers
+transformers==4.56.2
 accelerate
 Pillow
 torchvision==0.23.0+cu126
 safetensors==0.6.2
-huggingface_hub[cli]==0.35.3
+huggingface_hub ==0.35.3
 pydantic==2.11.9
 requests==2.32.4
 hf-transfer==0.1.9
