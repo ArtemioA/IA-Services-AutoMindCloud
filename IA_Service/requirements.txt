@@ -1,9 +1,8 @@
 fastapi>=0.111
 uvicorn[standard]>=0.30
 transformers==4.56.2
-huggingface_hub>=0.23
+huggingface_hub[cli]>=0.23
 accelerate>=0.30
 --index-url https://download.pytorch.org/whl/cpu
 torch==2.3.1
 torchvision>=0.18.0
-
