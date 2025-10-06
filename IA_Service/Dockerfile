@@ -1,54 +1,61 @@
-# Dockerfile — Qwen2-VL baked/offline (sin Python inline)
-FROM python:3.11-slim
+# ---------- Build stage (optional): prepare runtime base ----------
+FROM python:3.11-slim AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git tini procps && \
-    rm -rf /var/lib/apt/lists/*
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0
 
 WORKDIR /app
 
-# ===== Dependencias (requiere que requirements.txt tenga huggingface_hub[cli]) =====
-COPY requirements.txt .
+# Instala dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip
+
+# Copia requirements.txt e instala dependencias
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ===== Hornear el modelo en la imagen =====
-ARG MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct
-ARG MODEL_REV=main
-ENV MODEL_DIR=/models/Qwen2-VL-2B-Instruct
-RUN mkdir -p "${MODEL_DIR}"
 
-# Descarga robusta: soporta pesos en 1 archivo o shardeados
-RUN huggingface-cli download "${MODEL_REPO}" --revision "${MODEL_REV}" \
-    --local-dir "${MODEL_DIR}" --local-dir-use-symlinks False \
-    --include "config.json" \
-             "generation_config.json" \
-             "model.safetensors" \
-             "model-*.safetensors" \
-             "pytorch_model.bin" \
-             "pytorch_model-*.bin" \
-             "tokenizer.json" \
-             "tokenizer_config.json" \
-             "special_tokens_map.json" \
-             "vocab.json" \
-             "merges.txt" \
-             "image_processor/*" \
-             "processor_config.json" \
- && ( test -f "${MODEL_DIR}/model.safetensors" \
-   || ls "${MODEL_DIR}"/model-*.safetensors 1>/dev/null 2>&1 \
-   || test -f "${MODEL_DIR}/pytorch_model.bin" \
-   || ls "${MODEL_DIR}"/pytorch_model-*.bin 1>/dev/null 2>&1 ) \
- || (echo "❌ No se encontraron pesos en ${MODEL_DIR}"; ls -la "${MODEL_DIR}"; exit 1)
+# ---------- Runtime stage: imagen limpia y liviana ----------
+FROM python:3.11-slim
 
-# ===== App =====
-COPY main.py .
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
 
-# Caches seguros (no deberían usarse si todo está horneado)
-ENV HF_HOME=/tmp/hf \
+WORKDIR /app
+
+# Paquetes mínimos del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    python -m pip install --upgrade pip
+
+# Copia dependencias ya instaladas desde el builder
+COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copia tu aplicación
+COPY main.py /app/
+
+# Seguridad: usuario no root
+RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Variables para modo online (sin token y sin snapshot horneado)
+ENV MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct \
+    MODEL_DIR=/tmp/models/Qwen2-VL-2B-Instruct \
+    ALLOW_DOWNLOAD=1 \
+    HF_HOME=/tmp/hf \
     TRANSFORMERS_CACHE=/tmp/hf/transformers \
     HUGGINGFACE_HUB_CACHE=/tmp/hf/hub \
     PORT=8080
 
 EXPOSE 8080
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["bash","-lc","uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+
+# Arranque del servicio
+CMD ["bash", "-lc", "python -m uvico
