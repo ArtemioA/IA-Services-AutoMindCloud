@@ -1,18 +1,19 @@
+# cloudbuild.yaml
 steps:
   - name: gcr.io/kaniko-project/executor:latest
     args:
       - --destination=$_IMAGE
       - --cache=false
       - --use-new-run
-      - --snapshotMode=redo        # ↓ menor uso de RAM al “tomar snapshot”
+      - --snapshotMode=redo
       - --verbosity=info
 options:
-  machineType: E2_HIGHMEM_8        # 8 vCPU / 64 GB RAM
+  machineType: E2_HIGHMEM_8
   diskSizeGb: 200
 timeout: "3600s"
 images:
   - $_IMAGE
 substitutions:
-  _IMAGE: us-docker.pkg.dev/api-colab-demo/gcr.io/qwen2vl:baked
+  _IMAGE: us-docker.pkg.dev/api-colab-demo/qwen2vl/app:latest
 
 
