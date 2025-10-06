@@ -1,37 +1,52 @@
 substitutions:
   _REGION: us-central1
   _SERVICE: qwen2vl-canary
-  _IMAGE: us-docker.pkg.dev/$PROJECT_ID/qwen2vl/app:$SHORT_SHA
+  _AR_HOST: us-docker.pkg.dev
+  _REPO: qwen2vl
+  _IMAGE_NAME: app
 
 steps:
-  # 1) Build de la imagen
-  - name: gcr.io/kaniko-project/executor:latest
+  # 1) Build & push imagen (Cloud Build con Docker builder)
+  - name: 'gcr.io/cloud-builders/docker'
     args:
-      - --destination=${_IMAGE}
-      - --cache=false
-      - --use-new-run
-      - --snapshotMode=redo
-      - --verbosity=info
+      - 'build'
+      - '-t'
+      - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+      - '.'
 
-  # 2) Deploy a Cloud Run (MISMO pipeline)
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+
+  # 2) Deploy a Cloud Run (misma imagen recién construida)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
-      - run
-      - deploy
-      - ${_SERVICE}
-      - --image=${_IMAGE}
-      - --region=${_REGION}
-      - --allow-unauthenticated
-      - --cpu=2
-      - --memory=4Gi
-      - --timeout=600
-      - --max-instances=2
-      - --min-instances=0
-      - --concurrency=1
-      - --set-env-vars=MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct,ALLOW_DOWNLOAD=1,HF_HOME=/tmp/hf,TRANSFORMERS_CACHE=/tmp/hf/transformers,HUGGINGFACE_HUB_CACHE=/tmp/hf/hub,OMP_NUM_THREADS=1,MKL_NUM_THREADS=1
-      - --command=bash
-      - --args=-lc,uvicorn\ main:app\ --host\ 0.0.0.0\ --port\ ${PORT}
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE}'
+      - '--image=${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--allow-unauthenticated'
+      - '--cpu=2'
+      - '--memory=4Gi'
+      - '--timeout=600'
+      - '--concurrency=1'
+      - '--min-instances=0'
+      - '--max-instances=2'
+      - >-
+        --set-env-vars=MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct,
+        MODEL_DIR=/tmp/models/Qwen2-VL-2B-Instruct,
+        ALLOW_DOWNLOAD=1,
+        HF_HOME=/tmp/hf,
+        TRANSFORMERS_CACHE=/tmp/hf/transformers,
+        HUGGINGFACE_HUB_CACHE=/tmp/hf/hub,
+        HF_HUB_ENABLE_HF_TRANSFER=1,
+        OMP_NUM_THREADS=1,
+        MKL_NUM_THREADS=1
+      - '--command=bash'
+      - '--args=-lc,uvicorn main:app --host 0.0.0.0 --port ${PORT}'
 
 images:
-  - ${_IMAGE}
+  - '${_AR_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE_NAME}:${SHORT_SHA}'
