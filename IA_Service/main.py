@@ -4,11 +4,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ---------------- Env config ----------------
-MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR  = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")  # puede ser vacío
-ALLOW_DL   = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
+MODEL_REPO   = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
+MODEL_DIR    = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")  # puede ser vacío
+ALLOW_DL     = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
 FORCE_ONLINE = os.environ.get("FORCE_ONLINE", "0") == "1"  # ignora MODEL_DIR si 1
-PORT       = int(os.environ.get("PORT", "8080"))
+PORT         = int(os.environ.get("PORT", "8080"))
 
 # Writable caches (Cloud Run)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
@@ -46,21 +46,18 @@ def _has_local_snapshot(path: str) -> bool:
     """
     Snapshot válido si:
       - existe config.json
-      - y existe AL MENOS UN archivo de pesos: *.safetensors o pytorch_model.bin
-        (en la carpeta o subcarpetas)
+      - y existe AL MENOS UN archivo de pesos: *.safetensors o pytorch_model.bin (en la carpeta o subcarpetas)
     """
     if not path or not os.path.isdir(path):
         return False
     if not os.path.exists(os.path.join(path, "config.json")):
         return False
 
-    # Busca pesos en la carpeta y subcarpetas (evita falsos positivos)
-    for root, _dirs, files in os.walk(path):
+    for _root, _dirs, files in os.walk(path):
         if "pytorch_model.bin" in files:
             return True
-        for f in files:
-            if f.endswith(".safetensors"):
-                return True
+        if any(f.endswith(".safetensors") for f in files):
+            return True
     return False
 
 def _download_if_needed():
@@ -74,7 +71,7 @@ def _download_if_needed():
     snapshot_download(
         repo_id=MODEL_REPO,
         local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,
+        local_dir_use_symlinks=False,  # inofensivo aunque deprecado
         token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
     )
 
@@ -95,7 +92,6 @@ def _choose_src():
             _download_if_needed()
             use_local = _has_local_snapshot(MODEL_DIR)
         except Exception:
-            # Si falla la descarga, caeremos a repo online.
             use_local = False
     return (MODEL_DIR if use_local else MODEL_REPO), use_local
 
@@ -127,8 +123,12 @@ def _load_model_locked():
             src, trust_remote_code=True, local_files_only=local_only, token=token
         )
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            src, trust_remote_code=True, local_files_only=local_only, token=token,
-            torch_dtype=torch.float32,  # CPU friendly
+            src,
+            trust_remote_code=True,
+            local_files_only=local_only,
+            token=token,
+            dtype=torch.float32,         # evita warning (antes torch_dtype)
+            low_cpu_mem_usage=True,      # ayuda a reducir RAM pico en CPU
         ).to("cpu").eval()
 
         _model["proc"], _model["tok"], _model["model"] = proc, tok, model
@@ -192,6 +192,15 @@ def status():
 def healthz():
     return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
 
+# Endpoints alternativos de health (por si /healthz choca con proxy)
+@app.get("/health")
+def health_plain():
+    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
+
+@app.get("/_health")
+def health_alt():
+    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
+
 @app.get("/_dns", summary="DNS to huggingface.co (dev aid)")
 def dns_check():
     try:
@@ -217,6 +226,7 @@ def netcheck():
             out[url] = {"ok": False, "error": str(e)}
     return out
 
+# ---------- Generation: fixed to avoid empty outputs ----------
 @app.post("/generate", summary="Text-only generation")
 def generate(body: Ask):
     # Carga perezosa (bloqueante en la primera vez)
@@ -241,16 +251,41 @@ def generate(body: Ask):
         tok = _model["tok"]
         model = _model["model"]
 
-        inputs = tok(prompt, return_tensors="pt")
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=int(body.max_new_tokens or 128),
-                do_sample=(body.temperature or 0.0) > 0.0,
-                temperature=float(body.temperature or 0.0),
-            )
+        # Qwen2-VL chat template (texto puro)
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        ]
+        chat_text = tok.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False
+        )
 
-        text = tok.decode(output_ids[0], skip_special_tokens=True)
+        inputs = tok(chat_text, return_tensors="pt")
+        input_len = inputs["input_ids"].size(1)
+
+        gen = model.generate(
+            **inputs,
+            max_new_tokens=int(body.max_new_tokens or 128),
+            do_sample=(body.temperature or 0.0) > 0.0,
+            temperature=float(body.temperature or 0.0),
+            top_p=0.95 if (body.temperature or 0.0) > 0 else 1.0,
+            repetition_penalty=1.05,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
+            use_cache=True,
+        )
+
+        # Decodificar solo los tokens NUEVOS (no el prompt)
+        gen_ids = gen[0][input_len:]
+        text = tok.decode(gen_ids, skip_special_tokens=True).strip()
+
+        # Fallbacks por si queda vacío
+        if not text:
+            text = tok.decode(gen_ids, skip_special_tokens=False).strip()
+        if not text:
+            text = "(sin salida — intenta con un prompt más explícito o sube max_new_tokens)"
+
         return {"ok": True, "text": text}
 
     except Exception as e:
