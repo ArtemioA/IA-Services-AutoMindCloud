@@ -10,3 +10,8 @@ huggingface_hub>=0.25.0
 pydantic>=2.7
 requests>=2.31
 hf-transfer>=0.1.6
+
+einops>=0.7
+timm>=0.9
+numpy>=1.26
+protobuf>=3.20,<5
