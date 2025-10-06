@@ -1,4 +1,4 @@
-# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks
+# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks 
 import os, socket, threading, time, logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
