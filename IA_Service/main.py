@@ -1,235 +1,107 @@
-# main.py — Cloud Run (Qwen2-VL CPU) | descarga robusta + carga desde carpeta local
 import os
-import time
-import threading
-import logging
-from typing import Optional
+from threading import Lock
+from typing import Dict, Any
 
+import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
-# ---------- Logging ----------
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("qwen2vl")
-
-# ---------- Env ----------
-MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")
-ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
+# Ruta del modelo horneado (debe existir dentro de la imagen)
+MODEL_DIR = os.environ.get("MODEL_DIR", "/models/Qwen2-VL-2B-Instruct")
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Cloud Run: caches en /tmp (escribible)
-os.environ.setdefault("HF_HOME", "/tmp/hf")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
-# Acelerador de descargas (ya tienes hf-transfer en requirements)
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-# Limitar threads en CPU
+# Ahorro de CPU en contenedores
+torch.set_num_threads(1)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# ---------- App ----------
-app = FastAPI(title="Qwen2-VL (CPU)")
+# Caches seguros (no deberían activarse si todo es local, pero no molestan)
+os.environ.setdefault("HF_HOME", "/tmp/hf")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
 
-_state = {
-    "ready": False,
-    "loading": False,
-    "error": None,
-    "device": "cpu",
-    "model_repo": MODEL_REPO,
-    "mode": "online" if ALLOW_DOWNLOAD else "offline",
-    "t0": time.time(),
-}
-_lock = threading.Lock()
-_model = {"proc": None, "tok": None, "model": None}
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype  = torch.float16 if device == "cuda" else torch.float32
 
+app = FastAPI(title="Qwen2-VL (baked)")
 
-# ---------- Schemas ----------
-class Ask(BaseModel):
+# Singletons perezosos
+_model = None
+_processor = None
+_lock = Lock()
+
+class GenReq(BaseModel):
     prompt: str
-    max_new_tokens: Optional[int] = 128
-    temperature: Optional[float] = 0.0
+    max_new_tokens: int = 128
+    do_sample: bool = False
+    temperature: float = 0.7
+    top_p: float = 0.9
 
-
-# ---------- Helpers ----------
-def _download_snapshot(repo: str, target_dir: str) -> str:
-    """
-    Descarga robusta del repo de Hugging Face a 'target_dir' y devuelve la ruta resuelta.
-    Se usan allow_patterns para traer solo lo necesario (incluye shards .safetensors).
-    """
-    from huggingface_hub import snapshot_download
-
-    os.makedirs(target_dir, exist_ok=True)
-    token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
-
-    logger.info(f"📥 Prefetch de snapshot HF: repo={repo} -> {target_dir}")
-    resolved = snapshot_download(
-        repo_id=repo,
-        local_dir=target_dir,
-        local_dir_use_symlinks=False,
-        token=token,
-        allow_patterns=[
-            "*.safetensors", "*.bin", "*.json", "*.txt",
-            "*.model", "*.py", "*.md",
-            "tokenizer*", "config.json", "generation_config.json", "pytorch_model*"
-        ],
-    )
-    logger.info(f"✅ Snapshot lista en: {resolved}")
-    return resolved
-
-
-def _load_model_locked():
-    """Carga el modelo a RAM (usar siempre con _lock)."""
-    if _state["ready"] or _state["loading"]:
-        return
-
-    _state["loading"], _state["error"] = True, None
-    logger.info(
-        f"🚀 Cargando modelo: repo={MODEL_REPO}, dir={MODEL_DIR}, "
-        f"allow_download={ALLOW_DOWNLOAD}"
-    )
-
-    try:
-        import torch
-        torch.set_num_threads(1)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _state["device"] = device
-        logger.info(f"⚙️  Dispositivo: {device}")
-
-        # 1) Resolver snapshot a disco (si está permitido descargar)
-        local_path = MODEL_DIR
-        if ALLOW_DOWNLOAD:
-            local_path = _download_snapshot(MODEL_REPO, MODEL_DIR)
-        else:
-            if not os.path.exists(local_path) or not os.listdir(local_path):
-                raise RuntimeError(
-                    f"Modo offline y carpeta vacía: {local_path}. "
-                    f"Hornea el modelo en la imagen o habilita ALLOW_DOWNLOAD=1."
-                )
-
-        # 2) Cargar SIEMPRE desde carpeta local ya resuelta
-        from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
-
-        logger.info("📦 Cargando processor/tokenizer/model desde carpeta local…")
-        proc = AutoProcessor.from_pretrained(local_path, trust_remote_code=True)
-        tok = AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            local_path,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,  # CPU-friendly
-        ).to("cpu").eval()
-
-        _model["proc"], _model["tok"], _model["model"] = proc, tok, model
-        _state["ready"] = True
-        logger.info("🎉 Modelo cargado y listo para inferencia")
-
-    except Exception as e:
-        import traceback
-        msg = f"{type(e).__name__}: {e}"
-        _state["error"] = msg
-        logger.error(f"💥 Error cargando modelo: {msg}")
-        logger.error("📋 Traceback:\n%s", traceback.format_exc())
-    finally:
-        _state["loading"] = False
-
-
-def _ensure_loaded_bg():
-    """Dispara la carga en background si aún no está lista."""
-    if _state["ready"] or _state["loading"]:
-        return
-
-    def _bg():
-        with _lock:
-            if not _state["ready"]:
-                _load_model_locked()
-
-    threading.Thread(target=_bg, daemon=True).start()
-
-
-def _ensure_loaded_blocking():
-    """Bloquea hasta intentar cargar (usado por /generate)."""
-    if _state["ready"]:
+def _load_once():
+    global _model, _processor
+    if _model is not None and _processor is not None:
         return
     with _lock:
-        if not _state["ready"]:
-            _load_model_locked()
-
-
-# ---------- Endpoints ----------
-@app.get("/")
-def root():
-    """Estado del servicio; dispara carga lazy si procede."""
-    _ensure_loaded_bg()
-    return {
-        "ok": True,
-        "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
-        "device": _state["device"],
-        "mode": _state["mode"],
-        "model_repo": _state["model_repo"],
-        "model_dir": MODEL_DIR,
-        "uptime_s": round(time.time() - _state["t0"], 1),
-        "error": _state["error"],
-        "allow_download": ALLOW_DOWNLOAD,
-    }
-
+        if _model is not None and _processor is not None:
+            return
+        if not os.path.isdir(MODEL_DIR):
+            raise RuntimeError(f"MODEL_DIR inexistente: {MODEL_DIR}. Asegúrate de hornearlo en la imagen.")
+        # Carga SOLO desde disco local
+        _processor = AutoProcessor.from_pretrained(
+            MODEL_DIR, trust_remote_code=True, local_files_only=True
+        )
+        _model = Qwen2VLForConditionalGeneration.from_pretrained(
+            MODEL_DIR,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+            device_map="auto" if device == "cuda" else None,
+        )
+        if device == "cpu":
+            _model.to(device)
+        _model.eval()
 
 @app.get("/healthz")
 def healthz():
-    """Health check rápido (no bloquea)."""
-    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
-
+    try:
+        _load_once()
+        return {"ok": True, "device": device, "model_dir": MODEL_DIR}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "model_dir": MODEL_DIR}
 
 @app.post("/generate")
-def generate(body: Ask):
-    """Generación de texto (bloquea hasta intentar cargar el modelo)."""
-    logger.info(f"🎯 /generate prompt={body.prompt[:100]!r}...")
-    _ensure_loaded_blocking()
-
-    if not _state["ready"]:
-        status = "loading" if _state["loading"] else "cold"
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model not ready. status={status}; error={_state['error']}"
-        )
-
-    prompt = (body.prompt or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=422, detail="prompt vacío")
-
+def generate(r: GenReq):
     try:
-        import torch
-        tok = _model["tok"]
-        model = _model["model"]
+        _load_once()
+        # Chat template (texto solo para smoke test rápido)
+        messages = [{"role": "user", "content": [{"type": "text", "text": r.prompt}]}]
+        prompt = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-        inputs = tok(prompt, return_tensors="pt")
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=int(body.max_new_tokens or 128),
-                do_sample=(float(body.temperature or 0.0) > 0.0),
-                temperature=float(body.temperature or 0.0),
-            )
+        inputs = _processor(text=[prompt], return_tensors="pt")
+        if "input_ids" in inputs:
+            inputs["input_ids"] = inputs["input_ids"].to(_model.device)
+        if "attention_mask" in inputs:
+            inputs["attention_mask"] = inputs["attention_mask"].to(_model.device)
 
-        text = tok.decode(output_ids[0], skip_special_tokens=True)
-        logger.info(f"✅ Generación OK ({len(text)} chars)")
-        return {"ok": True, "text": text}
+        gen_kwargs: Dict[str, Any] = {"max_new_tokens": int(r.max_new_tokens)}
+        if r.do_sample:
+            gen_kwargs.update({"do_sample": True, "temperature": float(r.temperature), "top_p": float(r.top_p)})
 
+        with torch.inference_mode():
+            out_ids = _model.generate(**inputs, **gen_kwargs)
+
+        # Mantener solo la continuación
+        input_len = inputs["input_ids"].shape[-1]
+        gen_ids = out_ids[0, input_len:]
+        text = _processor.batch_decode(gen_ids.unsqueeze(0), skip_special_tokens=True)[0].strip()
+        if text.startswith("assistant\n"):
+            text = text[len("assistant\n"):].strip()
+        return {"text": text}
     except Exception as e:
-        logger.error("💥 Error en inferencia: %s: %s", type(e).__name__, e)
-        raise HTTPException(status_code=500, detail=f"inference error: {type(e).__name__}: {e}")
-
-
-# ---------- Startup ----------
-@app.on_event("startup")
-async def startup_event():
-    logger.info("🚀 Servicio iniciando… carga lazy en background")
-    _ensure_loaded_bg()
-
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"🏃 Ejecutando uvicorn en 0.0.0.0:{PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
