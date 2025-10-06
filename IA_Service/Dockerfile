@@ -2,18 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dependencias básicas del sistema
+# Paquetes base
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Instalar dependencias Python primero (mejor cacheo)
+# Python deps primero (mejor cacheo)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar código
+# Código
 COPY . .
 
-# Entorno (Cloud Run-friendly)
+# Entorno Cloud Run
 ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     HF_HOME=/tmp/hf \
@@ -25,5 +25,5 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8080
 
-# Arranque del servidor
+# Arranque
 CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
