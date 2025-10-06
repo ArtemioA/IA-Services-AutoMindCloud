@@ -8,7 +8,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 WORKDIR /app
 
 # Instala dependencias del sistema
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git && \
     rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --upgrade pip
@@ -25,9 +26,10 @@ os.makedirs('/app/models', exist_ok=True)
 snapshot_download(
     repo_id='Qwen/Qwen2-VL-2B-Instruct',
     local_dir='/app/models/Qwen2-VL-2B-Instruct',
-    local_dir_use_symlinks=False
+    local_dir_use_symlinks=False,
+    token=None
 )
-print('Modelo descargado exitosamente')
+print('✅ Modelo descargado exitosamente')
 "
 
 # ---------- Runtime stage ----------
@@ -42,7 +44,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Paquetes mínimos del sistema
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Copia dependencias y modelo pre-descargado
@@ -57,7 +60,7 @@ COPY main.py /app/
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Configuración para usar modelo local
+# Configuración para usar modelo LOCAL (sin descargas)
 ENV MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct \
     MODEL_DIR=/app/models/Qwen2-VL-2B-Instruct \
     ALLOW_DOWNLOAD=0 \
