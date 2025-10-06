@@ -16,7 +16,7 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# Disable hf_transfer if lib not present
+# Deshabilita hf_transfer si no está presente
 try:
     import importlib.util
     if importlib.util.find_spec("hf_transfer") is None:
@@ -49,9 +49,7 @@ def _has_local_snapshot(path: str) -> bool:
 
 def _download_if_needed():
     """Descarga el repo a MODEL_DIR si está permitido y aún no existe snapshot válido."""
-    if not ALLOW_DL:
-        return
-    if not MODEL_DIR:
+    if not ALLOW_DL or not MODEL_DIR:
         return
     if _has_local_snapshot(MODEL_DIR):
         return
@@ -61,7 +59,7 @@ def _download_if_needed():
         repo_id=MODEL_REPO,
         local_dir=MODEL_DIR,
         local_dir_use_symlinks=False,
-        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,  # si no hay token, va público
+        token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
     )
 
 def _choose_src():
@@ -98,11 +96,9 @@ def _load_model_locked():
         torch.set_num_threads(1)
         _state["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
-        src, using_local = _choose_src()
+        src, _using_local = _choose_src()
         local_only = (not ALLOW_DL)  # offline fuerza local-only
-
-        # Cargas con trust_remote_code y respetando offline/online
-        token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None  # puede ser None
+        token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
         proc = AutoProcessor.from_pretrained(
             src, trust_remote_code=True, local_files_only=local_only, token=token
@@ -242,4 +238,5 @@ def generate(body: Ask):
 # ---------------- Local dev ----------------
 if __name__ == "__main__":
     import uvicorn
+    # Solo para ejecución local; en Cloud Run, el Dockerfile lanza uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
