@@ -8,30 +8,32 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# ---------------- Logging ----------------
+# ---------- Logging ----------
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("qwen2vl")
 
-# ---------------- Env & defaults ----------------
+# ---------- Env ----------
 MODEL_REPO = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
 MODEL_DIR = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")
 ALLOW_DOWNLOAD = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
 PORT = int(os.environ.get("PORT", "8080"))
 
-# Cloud Run: caches deben ser escribibles (en /tmp)
+# Cloud Run: caches en /tmp (escribible)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 # Acelerador de descargas (ya tienes hf-transfer en requirements)
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# Limitar threads en CPU
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# --------------- App state ----------------
+# ---------- App ----------
 app = FastAPI(title="Qwen2-VL (CPU)")
+
 _state = {
     "ready": False,
     "loading": False,
@@ -44,20 +46,22 @@ _state = {
 _lock = threading.Lock()
 _model = {"proc": None, "tok": None, "model": None}
 
-# --------------- Schemas ------------------
+
+# ---------- Schemas ----------
 class Ask(BaseModel):
     prompt: str
     max_new_tokens: Optional[int] = 128
     temperature: Optional[float] = 0.0
 
 
-# --------------- Helpers ------------------
+# ---------- Helpers ----------
 def _download_snapshot(repo: str, target_dir: str) -> str:
     """
-    Descarga robusta del repo HF a 'target_dir' y devuelve la carpeta resuelta.
-    Usa allow_patterns para evitar traer artefactos innecesarios.
+    Descarga robusta del repo de Hugging Face a 'target_dir' y devuelve la ruta resuelta.
+    Se usan allow_patterns para traer solo lo necesario (incluye shards .safetensors).
     """
     from huggingface_hub import snapshot_download
+
     os.makedirs(target_dir, exist_ok=True)
     token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
@@ -67,24 +71,22 @@ def _download_snapshot(repo: str, target_dir: str) -> str:
         local_dir=target_dir,
         local_dir_use_symlinks=False,
         token=token,
-        # Archivos típicos necesarios para un modelo Transformers (incluye shards .safetensors)
         allow_patterns=[
             "*.safetensors", "*.bin", "*.json", "*.txt",
-            "*.model", "*.py", "*.md", "tokenizer*",
-            "config.json", "generation_config.json", "pytorch_model*"
+            "*.model", "*.py", "*.md",
+            "tokenizer*", "config.json", "generation_config.json", "pytorch_model*"
         ],
-        # confiamos en los reintentos del cliente; Cloud Run reinicia el contenedor si falla duro
     )
     logger.info(f"✅ Snapshot lista en: {resolved}")
     return resolved
 
 
 def _load_model_locked():
-    """Carga el modelo a RAM. Debe llamarse dentro de _lock."""
+    """Carga el modelo a RAM (usar siempre con _lock)."""
     if _state["ready"] or _state["loading"]:
         return
-    _state["loading"], _state["error"] = True, None
 
+    _state["loading"], _state["error"] = True, None
     logger.info(
         f"🚀 Cargando modelo: repo={MODEL_REPO}, dir={MODEL_DIR}, "
         f"allow_download={ALLOW_DOWNLOAD}"
@@ -97,7 +99,7 @@ def _load_model_locked():
         _state["device"] = device
         logger.info(f"⚙️  Dispositivo: {device}")
 
-        # Descarga snapshot completa y consistente a disco (si ALLOW_DOWNLOAD)
+        # 1) Resolver snapshot a disco (si está permitido descargar)
         local_path = MODEL_DIR
         if ALLOW_DOWNLOAD:
             local_path = _download_snapshot(MODEL_REPO, MODEL_DIR)
@@ -108,18 +110,16 @@ def _load_model_locked():
                     f"Hornea el modelo en la imagen o habilita ALLOW_DOWNLOAD=1."
                 )
 
-        # Carga SIEMPRE desde carpeta local ya resuelta
+        # 2) Cargar SIEMPRE desde carpeta local ya resuelta
         from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 
-        logger.info("📦 Cargando processor/tokenizer/model desde carpeta local...")
+        logger.info("📦 Cargando processor/tokenizer/model desde carpeta local…")
         proc = AutoProcessor.from_pretrained(local_path, trust_remote_code=True)
         tok = AutoTokenizer.from_pretrained(local_path, trust_remote_code=True)
-
-        # CPU-friendly: float32; para CPU a veces conviene float32 por compatibilidad
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             local_path,
             trust_remote_code=True,
-            torch_dtype=torch.float32,
+            torch_dtype=torch.float32,  # CPU-friendly
         ).to("cpu").eval()
 
         _model["proc"], _model["tok"], _model["model"] = proc, tok, model
@@ -133,7 +133,6 @@ def _load_model_locked():
         logger.error(f"💥 Error cargando modelo: {msg}")
         logger.error("📋 Traceback:\n%s", traceback.format_exc())
     finally:
-        # Si falló, ready será False y error tendrá detalle; loading vuelve a False
         _state["loading"] = False
 
 
@@ -159,10 +158,10 @@ def _ensure_loaded_blocking():
             _load_model_locked()
 
 
-# --------------- Endpoints ----------------
+# ---------- Endpoints ----------
 @app.get("/")
 def root():
-    """Devuelve estado y dispara carga lazy si procede."""
+    """Estado del servicio; dispara carga lazy si procede."""
     _ensure_loaded_bg()
     return {
         "ok": True,
@@ -190,7 +189,6 @@ def generate(body: Ask):
     _ensure_loaded_blocking()
 
     if not _state["ready"]:
-        # Devuelve 503 mientras está cargando o si hay error
         status = "loading" if _state["loading"] else "cold"
         raise HTTPException(
             status_code=503,
@@ -224,7 +222,7 @@ def generate(body: Ask):
         raise HTTPException(status_code=500, detail=f"inference error: {type(e).__name__}: {e}")
 
 
-# --------------- Startup ----------------
+# ---------- Startup ----------
 @app.on_event("startup")
 async def startup_event():
     logger.info("🚀 Servicio iniciando… carga lazy en background")
