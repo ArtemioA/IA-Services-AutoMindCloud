@@ -1,5 +1,7 @@
-# main.py — Cloud Run (Qwen2-VL-2B-Instruct CPU) con readiness consistente
-import os, socket, threading, time
+# main.py — Cloud Run (Qwen2-VL-2B-Instruct, CPU) con readiness consistente
+import os
+import socket
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -20,57 +22,88 @@ MODEL_DIR      = os.getenv("MODEL_DIR",  "/tmp/models/Qwen2-VL-2B-Instruct")
 HF_HOME        = os.getenv("HF_HOME", "/tmp/hf")
 PORT           = int(os.getenv("PORT", "8080"))
 
-# ======== App =========
+# ========= App =========
 app = FastAPI(title="Qwen2-VL CPU demo", version="1.0")
 
-# ======== Utilidades =========
+
+# ========= Helpers =========
 def _set_error(msg: str):
+    """Setea error global y baja readiness."""
     global last_error
     last_error = msg
     model_ready.clear()
     print(f"[LOAD][ERROR] {msg}", flush=True)
 
+
 def _ok(msg: str):
     print(f"[LOAD][OK] {msg}", flush=True)
+
 
 def _have_local_snapshot(path: str) -> bool:
     p = Path(path)
     return p.exists() and any(p.iterdir())
 
-# ======== Carga del modelo (hilo de fondo) =========
+
+# ========= Hilo de carga =========
 def _load_model():
+    """Descarga (si aplica) y carga Qwen2-VL usando la clase correcta."""
     global model, processor
     try:
-        # Ruta 1: FORZAR online (descarga)
+        # 1) Resolver ruta del snapshot (preferir HF cache; usar local si ya existe y no forzamos online)
+        snapshot_path: Optional[str] = None
+
+        from huggingface_hub import snapshot_download
+
         if FORCE_ONLINE:
             if not ALLOW_DOWNLOAD:
                 _set_error("FORCE_ONLINE=1 pero ALLOW_DOWNLOAD=0: impedida la descarga.")
                 return
-            _ok(f"FORCE_ONLINE=1: descargando {MODEL_REPO} en HF_HOME={HF_HOME}")
-            from huggingface_hub import snapshot_download
-            local_dir = snapshot_download(repo_id=MODEL_REPO, local_dir=MODEL_DIR, local_dir_use_symlinks=False)
-            _ok(f"Snapshot listo en {local_dir}")
-
-        # Ruta 2: si no forzamos online, intentamos local y opcionalmente online si ALLOW_DOWNLOAD=1
-        if not _have_local_snapshot(MODEL_DIR):
-            if ALLOW_DOWNLOAD:
-                _ok(f"No hay snapshot local en {MODEL_DIR}. Descargando {MODEL_REPO}...")
-                from huggingface_hub import snapshot_download
-                local_dir = snapshot_download(repo_id=MODEL_REPO, local_dir=MODEL_DIR, local_dir_use_symlinks=False)
-                _ok(f"Snapshot listo en {local_dir}")
+            _ok(f"FORCE_ONLINE=1: descargando {MODEL_REPO} -> HF cache (HF_HOME={HF_HOME})")
+            snapshot_path = snapshot_download(
+                repo_id=MODEL_REPO,
+                local_dir=None,                 # usar cache de HF
+                local_dir_use_symlinks=False
+            )
+        else:
+            if _have_local_snapshot(MODEL_DIR):
+                snapshot_path = MODEL_DIR
+                _ok(f"Usando snapshot LOCAL en {snapshot_path}")
+            elif ALLOW_DOWNLOAD:
+                _ok(f"No hay snapshot local en {MODEL_DIR}. Descargando {MODEL_REPO} -> HF cache")
+                snapshot_path = snapshot_download(
+                    repo_id=MODEL_REPO,
+                    local_dir=None,
+                    local_dir_use_symlinks=False
+                )
             else:
                 _set_error(f"Modelo no encontrado en {MODEL_DIR} y ALLOW_DOWNLOAD=0.")
                 return
-        else:
-            _ok(f"Usando snapshot local en {MODEL_DIR}")
 
-        # Carga en Transformers (CPU)
-        from transformers import AutoProcessor, AutoModelForVision2Seq
-        # Qwen2-VL requiere trust_remote_code=True
-        processor = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True)
-        model = AutoModelForVision2Seq.from_pretrained(
-            MODEL_DIR, trust_remote_code=True
+        if not snapshot_path or not Path(snapshot_path).exists():
+            _set_error(f"Snapshot path inválido: {snapshot_path}")
+            return
+
+        _ok(f"Snapshot listo en {snapshot_path}")
+
+        # 2) Cargar clases correctas (Qwen2-VL)
+        #    Requiere transformers >= 4.42 aprox. Si no está, daremos error claro.
+        try:
+            from transformers import Qwen2VLForConditionalGeneration
+        except Exception as e:
+            _set_error(
+                "Tu versión de 'transformers' no expone Qwen2VLForConditionalGeneration. "
+                "Actualiza a transformers>=4.44.0 (recomendado). Detalle: " + str(e)
+            )
+            return
+
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(snapshot_path, trust_remote_code=True)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            snapshot_path,
+            trust_remote_code=True
         )
+        # CPU
         model.to("cpu")
         model.eval()
 
@@ -79,7 +112,8 @@ def _load_model():
     except Exception as e:
         _set_error(f"Load error: {e!s}")
 
-# ======== Startup / Shutdown =========
+
+# ========= Eventos de app =========
 @app.on_event("startup")
 def on_startup():
     print("[BOOT] Vars:", {
@@ -88,27 +122,32 @@ def on_startup():
         "MODEL_REPO": MODEL_REPO,
         "MODEL_DIR": MODEL_DIR,
         "HF_HOME": HF_HOME,
+        "HOSTNAME": socket.gethostname()
     }, flush=True)
     t = threading.Thread(target=_load_model, daemon=True)
     t.start()
 
-# ======== Schemas =========
+
+# ========= Schemas =========
 class GenRequest(BaseModel):
     prompt: str
     max_new_tokens: int | None = 64
+    # Futuro (multimodal): image_url: str | None = None
 
-# ======== Endpoints =========
+
+# ========= Endpoints =========
 @app.get("/status")
 def status():
     return {"ok": True}
+
 
 @app.get("/readyz")
 def readyz():
     return {"ready": model_ready.is_set(), "error": last_error}
 
+
 @app.get("/_netcheck")
 def netcheck():
-    # Comprobación simple hacia Hugging Face
     import http.client
     try:
         conn = http.client.HTTPSConnection("huggingface.co", timeout=3)
@@ -117,6 +156,7 @@ def netcheck():
         return {"internet_ok": r.status < 500, "status": r.status}
     except Exception as e:
         return {"internet_ok": False, "error": str(e)}
+
 
 @app.get("/env")
 def env():
@@ -128,18 +168,30 @@ def env():
         "HF_HOME": HF_HOME,
     }
 
+
 @app.post("/generate")
 def generate(req: GenRequest):
+    # Readiness único para /readyz y /generate
     if not model_ready.is_set():
-        # Devuelve la misma causa que /readyz
         raise HTTPException(status_code=503, detail=last_error or "Model not ready.")
+
     try:
-        # Texto puro (sin imagen) — demostración mínima
-        # Para prompts multimodales, habría que aceptar image_url / bytes y pasarlas al processor.
-        inputs = processor(text=req.prompt, return_tensors="pt")
-        out = model.generate(**inputs, max_new_tokens=req.max_new_tokens or 64)
-        # En Qwen2-VL, la decodificación puede variar con trust_remote_code; mantenerlo simple:
+        # Texto-only mínimo (para multimodal, luego añadimos imágenes)
+        import torch
+        with torch.no_grad():
+            inputs = processor(text=req.prompt, return_tensors="pt")
+            out = model.generate(
+                **inputs,
+                max_new_tokens=req.max_new_tokens or 64
+            )
+        # Decodificar con el tokenizer del processor
         text = processor.tokenizer.decode(out[0], skip_special_tokens=True)
         return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"inference error: {e!s}")
+
+
+# ========= Main local =========
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
