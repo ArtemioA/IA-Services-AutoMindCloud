@@ -7,27 +7,30 @@ ENV PIP_NO_CACHE_DIR=1 \
     HF_HOME=/tmp/hf \
     TRANSFORMERS_CACHE=/tmp/hf/transformers \
     HUGGINGFACE_HUB_CACHE=/tmp/hf/hub \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    OMP_NUM_THREADS=1
+    OMP_NUM_THREADS=1 \
+    TOKENIZERS_PARALLELISM=false
 
 WORKDIR /app
 
-# System deps (minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
+# System deps (minimal) + tini as init
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user and tmp dirs
+# Non-root user + writable caches
 RUN useradd -m -u 10001 appuser \
  && mkdir -p /tmp/hf/transformers /tmp/hf/hub \
  && chown -R appuser:appuser /tmp /app
 
-# Install Python deps (cache-friendly)
+# Install Python deps first (better layer caching)
 COPY requirements.txt /app/
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
-# Copy app code last to preserve layer cache
+# Copy app code last to preserve cache
 COPY . /app
 RUN chown -R appuser:appuser /app
 
