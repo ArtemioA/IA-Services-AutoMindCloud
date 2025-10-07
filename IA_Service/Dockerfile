@@ -10,19 +10,16 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 WORKDIR /app
 
-# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps (cache-friendly)
 COPY requirements.txt /app/
 RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
-# Copy app code
 COPY . /app
 
-# Cloud Run provides $PORT
-ENV PORT=8080
+# (OPCIONAL) no necesitas fijar PORT aquí; Cloud Run lo inyecta.
+# ENV PORT=8080
 
-# Exec form (no shell); binds 0.0.0.0:$PORT
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+# ⬇️ Usa bash para expandir ${PORT}
+CMD ["bash","-lc","python -m uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
