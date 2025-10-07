@@ -1,4 +1,4 @@
-# main.py — Qwen2-VL-2B en Cloud Run (OFFLINE) con diagnóstico fuerte
+# main.py — Qwen2-VL-2B en Cloud Run (CPU, OFFLINE) con diagnóstico fuerte y carga “eager”
 import os
 import socket
 import threading
@@ -22,10 +22,10 @@ MODEL_DIR      = os.getenv("MODEL_DIR",  "/tmp/models/Qwen2-VL-2B-Instruct")
 HF_HOME        = os.getenv("HF_HOME", "/tmp/hf")
 PORT           = int(os.getenv("PORT", "8080"))
 OMP_THREADS    = int(os.getenv("OMP_NUM_THREADS", "1"))
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-# Archivos/patrones mínimos para considerar el snapshot válido
 REQUIRED_FILES = ["config.json", "tokenizer_config.json"]
-REQUIRED_PATTERNS = ["*.safetensors", "*.bin"]  # al menos uno debe existir
+REQUIRED_PATTERNS = ["*.safetensors", "*.bin"]  # al menos uno
 
 app = FastAPI(title="Qwen2-VL CPU demo", version="1.0")
 
@@ -47,13 +47,16 @@ def _have_local_snapshot(path: str) -> bool:
     return p.exists() and any(p.iterdir())
 
 
-def _list_some(path: str, limit: int = 60) -> List[str]:
+def _list_some(path: str, limit: int = 80) -> List[str]:
     out: List[str] = []
     root = Path(path)
     if not root.exists():
         return out
     for i, f in enumerate(root.rglob("*")):
-        rel = str(f.relative_to(root)) if f.exists() else str(f)
+        try:
+            rel = str(f.relative_to(root))
+        except Exception:
+            rel = str(f)
         out.append(rel)
         if i + 1 >= limit:
             break
@@ -66,7 +69,6 @@ def _validate_snapshot(path: str) -> Optional[str]:
         return f"Snapshot no existe: {path}"
     if not any(p.iterdir()):
         return f"Snapshot vacío en: {path}"
-
     missing = [f for f in REQUIRED_FILES if not (p / f).exists()]
     has_weights = any(next(p.glob(pat), None) for pat in REQUIRED_PATTERNS)
     problems = []
@@ -83,14 +85,15 @@ def _validate_snapshot(path: str) -> Optional[str]:
 def _load_model():
     global model, processor
     try:
-        # Torch threads (CPU)
+        # 0) Torch threads para CPU
         try:
             import torch
             torch.set_num_threads(max(1, OMP_THREADS))
-        except Exception:
-            pass
+            _ok(f"Torch threads: {torch.get_num_threads()}")
+        except Exception as e:
+            _ok(f"Torch threads no ajustados: {e}")
 
-        # Política OFFLINE primero
+        # 1) Resolver snapshot (OFFLINE por defecto)
         if not ALLOW_DOWNLOAD:
             if not _have_local_snapshot(MODEL_DIR):
                 _set_error(f"Modelo no encontrado en {MODEL_DIR} y ALLOW_DOWNLOAD=0 (offline).")
@@ -100,24 +103,23 @@ def _load_model():
                 _set_error(err + f" | archivos_vistos={_list_some(MODEL_DIR, 30)}")
                 return
             snapshot_path = MODEL_DIR
-            _ok(f"Usando snapshot LOCAL en {snapshot_path} (offline)")
+            _ok(f"Usando snapshot LOCAL: {snapshot_path}")
         else:
-            # ONLINE (no recomendado para Cloud Run, pero lo dejamos correcto)
             from huggingface_hub import snapshot_download
             if _have_local_snapshot(MODEL_DIR) and not FORCE_ONLINE:
                 snapshot_path = MODEL_DIR
-                _ok(f"Usando snapshot LOCAL en {snapshot_path}")
+                _ok(f"Usando snapshot LOCAL: {snapshot_path}")
             else:
                 _ok(f"Descargando {MODEL_REPO} (HF_HOME={HF_HOME}) ...")
                 snapshot_path = snapshot_download(repo_id=MODEL_REPO, local_dir=None)
-                _ok(f"Snapshot en cache HF: {snapshot_path}")
-            # Validación (por si local_dir apunta a carpeta propia)
+                _ok(f"Snapshot cache HF: {snapshot_path}")
             err = _validate_snapshot(snapshot_path)
             if err:
                 _set_error(err)
                 return
 
-        # Carga de clases
+        # 2) Cargar clases (transformers >= 4.44)
+        _ok("Importando clases de transformers...")
         try:
             from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
         except Exception as e:
@@ -127,17 +129,30 @@ def _load_model():
             )
             return
 
-        processor = AutoProcessor.from_pretrained(snapshot_path, trust_remote_code=True)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(snapshot_path, trust_remote_code=True)
+        # 3) Cargar processor
+        _ok("Cargando AutoProcessor...")
+        processor_local = AutoProcessor.from_pretrained(snapshot_path, trust_remote_code=True)
+        _ok("AutoProcessor cargado.")
 
-        # CPU
-        try:
-            import torch
-            model.to("cpu")
-            model.eval()
-        except Exception as e:
-            _set_error(f"No pude mover el modelo a CPU: {e!s}")
-            return
+        # 4) Cargar modelo (amigable a CPU)
+        _ok("Cargando modelo (low_cpu_mem_usage, attn=eager)...")
+        import torch
+        model_local = Qwen2VLForConditionalGeneration.from_pretrained(
+            snapshot_path,
+            trust_remote_code=True,
+            device_map=None,                # CPU explícito
+            low_cpu_mem_usage=True,         # reduce picos de RAM al cargar
+            attn_implementation="eager",    # evita backends no disponibles
+            torch_dtype=torch.float32       # CPU estable (float16 en CPU no aplica)
+        )
+        _ok("Pesos cargados; moviendo a CPU y eval()...")
+        model_local.to("cpu")
+        model_local.eval()
+
+        # 5) Publicar en global
+        global model, processor
+        model = model_local
+        processor = processor_local
 
         model_ready.set()
         _ok("Modelo listo.")
@@ -203,7 +218,6 @@ def env():
 
 @app.get("/disk")
 def disk():
-    # Espacio útil para depurar en /app y /tmp
     def _fs(p: str) -> Dict[str, int]:
         import os
         try:
@@ -232,27 +246,20 @@ def models():
 def generate(req: GenRequest):
     if not model_ready.is_set():
         raise HTTPException(status_code=503, detail=last_error or "Model not ready.")
-
     try:
         import torch
         with torch.no_grad():
             inputs = processor(text=req.prompt, return_tensors="pt")
-            tokenizer = getattr(processor, "tokenizer", None)
+            tok = getattr(processor, "tokenizer", None)
             extra = {}
-            if tokenizer is not None:
-                # Establecer pad/eos si faltan (algunos snapshots)
-                if getattr(tokenizer, "eos_token_id", None) is None and getattr(tokenizer, "eos_token", None):
-                    tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
-                if getattr(tokenizer, "pad_token_id", None) is None:
-                    tokenizer.pad_token = tokenizer.eos_token or tokenizer.pad_token or tokenizer.unk_token
-                    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-                extra = {
-                    "eos_token_id": tokenizer.eos_token_id,
-                    "pad_token_id": tokenizer.pad_token_id,
-                }
-
+            if tok is not None:
+                if getattr(tok, "eos_token_id", None) is None and getattr(tok, "eos_token", None):
+                    tok.eos_token_id = tok.convert_tokens_to_ids(tok.eos_token)
+                if getattr(tok, "pad_token_id", None) is None:
+                    tok.pad_token = tok.eos_token or tok.pad_token or tok.unk_token
+                    tok.pad_token_id = tok.convert_tokens_to_ids(tok.pad_token)
+                extra = {"eos_token_id": tok.eos_token_id, "pad_token_id": tok.pad_token_id}
             out = model.generate(**inputs, max_new_tokens=req.max_new_tokens or 64, **extra)
-
         if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
             text = processor.tokenizer.decode(out[0], skip_special_tokens=True)
         else:
