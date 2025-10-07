@@ -18,19 +18,19 @@ RUN python -m pip install --upgrade pip \
       "huggingface-hub>=0.34.0,<1.0" \
       "hf-transfer==0.1.9"
 
-# Puedes cambiar el repo en el build:  --build-arg MODEL_REPO=Qwen/Qwen2-VL-7B-Instruct
+# Puedes cambiar el repo al construir:  --build-arg MODEL_REPO=Qwen/Qwen2-VL-7B-Instruct
 ARG MODEL_REPO="Qwen/Qwen2-VL-2B-Instruct"
 ENV MODEL_OUT="/app/models/Qwen2-VL-2B-Instruct"
 
-# Descarga del snapshot (sin here-docs)
+# Descarga del snapshot (sin here-docs Docker; una sola línea Python)
 RUN python -c "from huggingface_hub import snapshot_download; import os, pathlib; \
 repo=os.environ.get('MODEL_REPO'); out=os.environ.get('MODEL_OUT'); \
 pathlib.Path(out).mkdir(parents=True, exist_ok=True); \
 snapshot_download(repo_id=repo, local_dir=out); \
-print('>> BAKED:', out)"
+print('>> BAKED TO:', out)"
 
-# Verificación estricta: falla el build si quedó vacío
-RUN test -d "$MODEL_OUT" && [ -n "$(ls -A "$MODEL_OUT" 2>/dev/null)" ] \
+# Verificación estricta: falla si está vacío
+RUN test -d "$MODEL_OUT" && [ -n \"$(ls -A \"$MODEL_OUT\" 2>/dev/null)\" ] \
  || (echo '❌ snapshot vacío en $MODEL_OUT' && exit 1)
 
 
@@ -55,12 +55,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-# Usuario no-root y caches escribibles
+# Usuario no-root y cachés escribibles
 RUN useradd -m -u 10001 appuser \
  && mkdir -p /tmp/hf/transformers /tmp/hf/hub \
  && chown -R appuser:appuser /tmp /app
 
-# ===== Dependencias RUNTIME (exactas) =====
+# ===== Dependencias RUNTIME (exactas que pediste) =====
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir \
       fastapi==0.118.0 \
@@ -74,7 +74,7 @@ RUN python -m pip install --upgrade pip \
       requests==2.32.4 \
       hf-transfer==0.1.9
 
-# PyTorch CPU + torchvision (desde índice oficial CPU)
+# PyTorch CPU + torchvision (índice CPU oficial)
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cpu \
       torch==2.3.1+cpu \
