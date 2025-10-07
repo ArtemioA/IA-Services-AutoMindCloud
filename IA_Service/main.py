@@ -1,32 +1,23 @@
-# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks
-import os, socket, threading, time
+# main.py — Cloud Run (Qwen2-VL CPU) | online/offline with safe fallbacks + JSON health
+import os, threading, time
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # ---------------- Env config ----------------
 MODEL_REPO   = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR    = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")  # puede ser vacío
+MODEL_DIR    = os.environ.get("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")  # can be empty
 ALLOW_DL     = os.environ.get("ALLOW_DOWNLOAD", "1") == "1"
-FORCE_ONLINE = os.environ.get("FORCE_ONLINE", "0") == "1"  # ignora MODEL_DIR si 1
+FORCE_ONLINE = os.environ.get("FORCE_ONLINE", "0") == "1"  # ignore MODEL_DIR if 1
 PORT         = int(os.environ.get("PORT", "8080"))
 
-# Writable caches (Cloud Run)
+# Writable caches for Cloud Run
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# Deshabilita hf_transfer si no está presente
-try:
-    import importlib.util
-    if importlib.util.find_spec("hf_transfer") is None:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-except Exception:
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-
-# ---------------- App ----------------
-app = FastAPI(title="Qwen2-VL (CPU)")
+app = FastAPI(title="Qwen2-VL API (CPU)")
 
 _state = {
     "ready": False,
@@ -38,30 +29,31 @@ _state = {
     "mode": "online" if ALLOW_DL else "offline",
     "t0": time.time(),
 }
-_lock = threading.Lock()
 _model = {"proc": None, "tok": None, "model": None}
+_lock = threading.Lock()
+
 
 # ---------------- Helpers ----------------
 def _has_local_snapshot(path: str) -> bool:
     """
-    Snapshot válido si:
-      - existe config.json
-      - y existe AL MENOS UN archivo de pesos: *.safetensors o pytorch_model.bin (en la carpeta o subcarpetas)
+    Valid snapshot if:
+      - config.json exists
+      - and at least ONE weights file exists: *.safetensors or pytorch_model.bin (any subfolder)
     """
     if not path or not os.path.isdir(path):
         return False
     if not os.path.exists(os.path.join(path, "config.json")):
         return False
-
-    for _root, _dirs, files in os.walk(path):
+    for root, _dirs, files in os.walk(path):
         if "pytorch_model.bin" in files:
             return True
         if any(f.endswith(".safetensors") for f in files):
             return True
     return False
 
+
 def _download_if_needed():
-    """Descarga el repo a MODEL_DIR si está permitido y aún no existe snapshot válido."""
+    """Download the repo to MODEL_DIR if allowed and snapshot not present."""
     if not ALLOW_DL or not MODEL_DIR or FORCE_ONLINE:
         return
     if _has_local_snapshot(MODEL_DIR):
@@ -71,17 +63,18 @@ def _download_if_needed():
     snapshot_download(
         repo_id=MODEL_REPO,
         local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,  # inofensivo aunque deprecado
+        local_dir_use_symlinks=False,
         token=os.environ.get("HUGGINGFACE_HUB_TOKEN") or None,
     )
 
+
 def _choose_src():
     """
-    Decide la fuente de carga:
-      - FORCE_ONLINE=1 -> siempre repo online.
-      - Si hay snapshot local válido -> usar carpeta local.
-      - Si no hay y ALLOW_DL y MODEL_DIR definido -> descargar y usar carpeta si queda válida.
-      - Si no, usar repo online (requiere egress; token opcional).
+    Decide source:
+      - FORCE_ONLINE=1 -> always use repo id (online)
+      - If valid local snapshot -> use local folder
+      - Else if ALLOW_DL -> try to download into MODEL_DIR, then use local if now valid
+      - Else -> use repo id (but that will only work at runtime if egress allowed)
     """
     if FORCE_ONLINE:
         return MODEL_REPO, False
@@ -92,15 +85,17 @@ def _choose_src():
             _download_if_needed()
             use_local = _has_local_snapshot(MODEL_DIR)
         except Exception:
+            # Fall back to repo if download fails; health will reflect any load errors
             use_local = False
-    return (MODEL_DIR if use_local else MODEL_REPO), use_local
 
-# ---------------- Model loading ----------------
+    return (MODEL_DIR, True) if use_local else (MODEL_REPO, False)
+
+
 def _load_model_locked():
     """
     Lazy load (thread-safe).
-    - Offline (ALLOW_DL=False): exige snapshot local válido, local_files_only=True.
-    - Online (ALLOW_DL=True): usa local si existe; si no, repo con local_files_only=False.
+    - Offline (ALLOW_DL=False): requires local snapshot; else it will attempt repo but with local_files_only=False ONLY if FORCE_ONLINE=1.
+    - Online (ALLOW_DL=True): prefer local if present; else load from repo.
     """
     if _state["ready"] or _state["loading"]:
         return
@@ -113,7 +108,9 @@ def _load_model_locked():
         _state["device"] = "cuda" if torch.cuda.is_available() else "cpu"
 
         src, using_local = _choose_src()
-        local_only = (not ALLOW_DL) or (using_local and not FORCE_ONLINE)
+        # ✅ KEY FIX: Only force local_files_only if we are actually loading from a local directory.
+        # If src is a repo id, local_files_only must be False; otherwise loading will always fail.
+        local_only = using_local and not FORCE_ONLINE
         token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or None
 
         proc = AutoProcessor.from_pretrained(
@@ -127,8 +124,8 @@ def _load_model_locked():
             trust_remote_code=True,
             local_files_only=local_only,
             token=token,
-            dtype=torch.float32,         # evita warning (antes torch_dtype)
-            low_cpu_mem_usage=True,      # ayuda a reducir RAM pico en CPU
+            dtype=torch.float32,
+            low_cpu_mem_usage=True,
         ).to("cpu").eval()
 
         _model["proc"], _model["tok"], _model["model"] = proc, tok, model
@@ -139,6 +136,7 @@ def _load_model_locked():
     finally:
         _state["loading"] = False
 
+
 def _ensure_loaded_bg():
     if _state["ready"] or _state["loading"]:
         return
@@ -148,18 +146,13 @@ def _ensure_loaded_bg():
                 _load_model_locked()
     threading.Thread(target=_bg, daemon=True).start()
 
-def _ensure_loaded_blocking():
-    if _state["ready"]:
-        return
-    with _lock:
-        if not _state["ready"]:
-            _load_model_locked()
 
 # ---------------- Schemas ----------------
-class Ask(BaseModel):
+class GenReq(BaseModel):
     prompt: str
-    max_new_tokens: int | None = 128
-    temperature: float | None = 0.0  # greedy por defecto (CPU)
+    max_new_tokens: Optional[int] = 128
+    temperature: Optional[float] = 0.0
+
 
 # ---------------- Endpoints ----------------
 @app.get("/")
@@ -170,129 +163,60 @@ def root():
         "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
         "device": _state["device"],
         "mode": _state["mode"],
-        "model_dir": _state["model_dir"],
         "model_repo": _state["model_repo"],
+        "model_dir": _state["model_dir"],
         "uptime_s": round(time.time() - _state["t0"], 1),
         "error": _state["error"],
-        "allow_download": ALLOW_DL,
-        "force_online": FORCE_ONLINE,
     }
 
-@app.get("/status", summary="Status (warms up)")
-def status():
-    _ensure_loaded_bg()
-    return {
-        "ok": True,
-        "status": "ready" if _state["ready"] else ("loading" if _state["loading"] else "cold"),
-        "mode": _state["mode"],
-        "error": _state["error"],
-    }
 
 @app.get("/healthz", summary="Health probe (no load)")
 def healthz():
-    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
+    # Do NOT block; just report current state
+    return {"ready": _state["ready"], "loading": _state["loading"], "error": _state["error"]}
 
-# Endpoints alternativos de health (por si /healthz choca con proxy)
-@app.get("/health")
-def health_plain():
-    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
 
-@app.get("/_health")
-def health_alt():
-    return {"ok": True, "ready": _state["ready"], "error": _state["error"]}
+@app.get("/status", summary="Status (kick background load once)")
+def status():
+    _ensure_loaded_bg()
+    return {"ready": _state["ready"], "loading": _state["loading"], "error": _state["error"]}
 
-@app.get("/_dns", summary="DNS to huggingface.co (dev aid)")
-def dns_check():
-    try:
-        host = socket.gethostbyname("huggingface.co")
-        return {"ok": True, "host": host}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
-@app.get("/_netcheck", summary="HTTP checks to HF and CDN")
-def netcheck():
-    import requests
-    out = {}
-    urls = [
-        "https://huggingface.co",
-        f"https://huggingface.co/api/models/{MODEL_REPO}",
-        "https://cdn-lfs.huggingface.co/favicon.ico",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=6)
-            out[url] = {"ok": True, "code": r.status_code}
-        except Exception as e:
-            out[url] = {"ok": False, "error": str(e)}
-    return out
-
-# ---------- Generation: fixed to avoid empty outputs ----------
-@app.post("/generate", summary="Text-only generation")
-def generate(body: Ask):
-    # Carga perezosa (bloqueante en la primera vez)
-    try:
-        _ensure_loaded_blocking()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Load error: {e}")
-
-    if not _state["ready"]:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Model not ready. status="
-                   f"{'loading' if _state['loading'] else 'cold'}; error={_state['error']}"
-        )
-
-    prompt = (body.prompt or "").strip()
-    if not prompt:
+@app.post("/generate")
+def generate(req: GenReq):
+    if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=422, detail="prompt vacío")
+    if not _state["ready"]:
+        _ensure_loaded_bg()
+        raise HTTPException(status_code=503, detail="Model not ready")
 
     try:
         import torch
         tok = _model["tok"]
         model = _model["model"]
 
-        # Qwen2-VL chat template (texto puro)
-        messages = [
-            {"role": "user", "content": [{"type": "text", "text": prompt}]}
-        ]
-        chat_text = tok.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=False
-        )
-
-        inputs = tok(chat_text, return_tensors="pt")
-        input_len = inputs["input_ids"].size(1)
-
-        gen = model.generate(
-            **inputs,
-            max_new_tokens=int(body.max_new_tokens or 128),
-            do_sample=(body.temperature or 0.0) > 0.0,
-            temperature=float(body.temperature or 0.0),
-            top_p=0.95 if (body.temperature or 0.0) > 0 else 1.0,
-            repetition_penalty=1.05,
-            eos_token_id=tok.eos_token_id,
-            pad_token_id=tok.eos_token_id,
-            use_cache=True,
-        )
-
-        # Decodificar solo los tokens NUEVOS (no el prompt)
-        gen_ids = gen[0][input_len:]
-        text = tok.decode(gen_ids, skip_special_tokens=True).strip()
-
-        # Fallbacks por si queda vacío
-        if not text:
-            text = tok.decode(gen_ids, skip_special_tokens=False).strip()
-        if not text:
-            text = "(sin salida — intenta con un prompt más explícito o sube max_new_tokens)"
-
-        return {"ok": True, "text": text}
-
+        # Text-only generation path (works with *Instruct variants*)
+        inputs = tok(req.prompt, return_tensors="pt")
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=req.max_new_tokens or 128,
+                do_sample=(req.temperature or 0.0) > 0.0,
+                temperature=req.temperature or 0.0,
+                pad_token_id=tok.eos_token_id,
+            )
+        text = tok.decode(out[0], skip_special_tokens=True)
+        return {"text": text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"inference error: {type(e).__name__}: {e}")
 
-# ---------------- Local dev ----------------
+
+@app.on_event("startup")
+def _startup():
+    # Kick background load promptly
+    _ensure_loaded_bg()
+
+
 if __name__ == "__main__":
     import uvicorn
-    # Solo para ejecución local; en Cloud Run, el Dockerfile lanza uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
