@@ -1,4 +1,4 @@
-# ---------- Build stage: descarga el snapshot ----------
+# ---------- Build stage: descarga snapshot ----------
 FROM python:3.11-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
@@ -13,23 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir "huggingface_hub>=0.23.0"
 
-# Permite cambiar repo en tiempo de build si quieres
+# Cambiable en build si lo necesitas: --build-arg MODEL_REPO=Qwen/Qwen2-VL-2B-Instruct
 ARG MODEL_REPO="Qwen/Qwen2-VL-2B-Instruct"
 ENV MODEL_OUT="/app/models/Qwen2-VL-2B-Instruct"
 
-# ↓ Descarga snapshot al directorio final dentro de la imagen
-RUN python - <<'PY'
-from huggingface_hub import snapshot_download
-import os, sys
-repo = os.environ.get("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-out  = os.environ.get("MODEL_OUT", "/app/models/Qwen2-VL-2B-Instruct")
-print(f">> Descargando {repo} a {out}", flush=True)
-p = snapshot_download(repo_id=repo, local_dir=out, local_dir_use_symlinks=False)
-print(">> Snapshot at:", p, flush=True)
-PY
+# Descarga snapshot al directorio final dentro de la imagen
+RUN python -c "from huggingface_hub import snapshot_download; import os, pathlib; repo=os.environ.get('MODEL_REPO','Qwen/Qwen2-VL-2B-Instruct'); out=os.environ.get('MODEL_OUT','/app/models/Qwen2-VL-2B-Instruct'); pathlib.Path(out).mkdir(parents=True, exist_ok=True); p=snapshot_download(repo_id=repo, local_dir=out, local_dir_use_symlinks=False); print('>> Snapshot at:', p)"
 
-# Verificación dura en build: debe existir y tener archivos
-RUN test -d "$MODEL_OUT" && find "$MODEL_OUT" -maxdepth 2 -type f | head -n 20 && du -h -d1 /app/models || (echo "❌ Snapshot no presente"; exit 1)
+# Verificación dura (falla el build si no existe)
+RUN test -d \"$MODEL_OUT\" && find \"$MODEL_OUT\" -maxdepth 2 -type f | head -n 20 && du -h -d1 /app/models
 
 # ---------- Runtime image ----------
 FROM python:3.11-slim
@@ -54,16 +46,18 @@ RUN useradd -m -u 10001 appuser \
  && mkdir -p /tmp/hf/transformers /tmp/hf/hub \
  && chown -R appuser:appuser /tmp /app
 
+# Requisitos de ejecución
 COPY requirements.txt /app/
 RUN python -m pip install --upgrade pip \
  && pip install --no-cache-dir -r requirements.txt
 
+# Código app
 COPY . /app
 
-# Copia el snapshot horneado
+# Snapshot horneado desde el stage builder
 COPY --from=builder /app/models /app/models
 
-# Verificación en runtime layer (para ver en el build log)
+# Verificación visible
 RUN ls -lah /app/models && du -h -d1 /app/models && test -d /app/models/Qwen2-VL-2B-Instruct
 
 RUN chown -R appuser:appuser /app
