@@ -1,171 +1,145 @@
-# main.py — FastAPI en Cloud Run con /healthz, /status, /readyz y carga perezosa
-import os
-import threading
+# main.py — Cloud Run (Qwen2-VL-2B-Instruct CPU) con readiness consistente
+import os, socket, threading, time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ----------------- Config -----------------
+# ========= Estado global =========
+model_ready = threading.Event()
+last_error: Optional[str] = None
+model = None
+processor = None
+
+# ========= Config por entorno =========
 ALLOW_DOWNLOAD = os.getenv("ALLOW_DOWNLOAD", "0") == "1"
-FORCE_ONLINE   = os.getenv("FORCE_ONLINE", "0") == "1"
+FORCE_ONLINE   = os.getenv("FORCE_ONLINE",   "0") == "1"
 MODEL_REPO     = os.getenv("MODEL_REPO", "Qwen/Qwen2-VL-2B-Instruct")
-MODEL_DIR      = os.getenv("MODEL_DIR", "/tmp/models/Qwen2-VL-2B-Instruct")
+MODEL_DIR      = os.getenv("MODEL_DIR",  "/tmp/models/Qwen2-VL-2B-Instruct")
+HF_HOME        = os.getenv("HF_HOME", "/tmp/hf")
+PORT           = int(os.getenv("PORT", "8080"))
 
-# Caches HF en /tmp (RW en Cloud Run)
-os.environ.setdefault("HF_HOME", "/tmp/hf")
-os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf/transformers")
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/tmp/hf/hub")
+# ======== App =========
+app = FastAPI(title="Qwen2-VL CPU demo", version="1.0")
 
-# ----------------- App & Estado -----------------
-app = FastAPI(title="Qwen2-VL CPU Demo", version="1.0")
+# ======== Utilidades =========
+def _set_error(msg: str):
+    global last_error
+    last_error = msg
+    model_ready.clear()
+    print(f"[LOAD][ERROR] {msg}", flush=True)
 
-# Estado compartido del modelo
-_model = {
-    "ready": False,
-    "error": None,
-    "processor": None,
-    "model": None,   # CausalLM
-}
-_lock = threading.Lock()
+def _ok(msg: str):
+    print(f"[LOAD][OK] {msg}", flush=True)
 
+def _have_local_snapshot(path: str) -> bool:
+    p = Path(path)
+    return p.exists() and any(p.iterdir())
+
+# ======== Carga del modelo (hilo de fondo) =========
+def _load_model():
+    global model, processor
+    try:
+        # Ruta 1: FORZAR online (descarga)
+        if FORCE_ONLINE:
+            if not ALLOW_DOWNLOAD:
+                _set_error("FORCE_ONLINE=1 pero ALLOW_DOWNLOAD=0: impedida la descarga.")
+                return
+            _ok(f"FORCE_ONLINE=1: descargando {MODEL_REPO} en HF_HOME={HF_HOME}")
+            from huggingface_hub import snapshot_download
+            local_dir = snapshot_download(repo_id=MODEL_REPO, local_dir=MODEL_DIR, local_dir_use_symlinks=False)
+            _ok(f"Snapshot listo en {local_dir}")
+
+        # Ruta 2: si no forzamos online, intentamos local y opcionalmente online si ALLOW_DOWNLOAD=1
+        if not _have_local_snapshot(MODEL_DIR):
+            if ALLOW_DOWNLOAD:
+                _ok(f"No hay snapshot local en {MODEL_DIR}. Descargando {MODEL_REPO}...")
+                from huggingface_hub import snapshot_download
+                local_dir = snapshot_download(repo_id=MODEL_REPO, local_dir=MODEL_DIR, local_dir_use_symlinks=False)
+                _ok(f"Snapshot listo en {local_dir}")
+            else:
+                _set_error(f"Modelo no encontrado en {MODEL_DIR} y ALLOW_DOWNLOAD=0.")
+                return
+        else:
+            _ok(f"Usando snapshot local en {MODEL_DIR}")
+
+        # Carga en Transformers (CPU)
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        # Qwen2-VL requiere trust_remote_code=True
+        processor = AutoProcessor.from_pretrained(MODEL_DIR, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            MODEL_DIR, trust_remote_code=True
+        )
+        model.to("cpu")
+        model.eval()
+
+        model_ready.set()
+        _ok("Modelo listo.")
+    except Exception as e:
+        _set_error(f"Load error: {e!s}")
+
+# ======== Startup / Shutdown =========
+@app.on_event("startup")
+def on_startup():
+    print("[BOOT] Vars:", {
+        "ALLOW_DOWNLOAD": ALLOW_DOWNLOAD,
+        "FORCE_ONLINE": FORCE_ONLINE,
+        "MODEL_REPO": MODEL_REPO,
+        "MODEL_DIR": MODEL_DIR,
+        "HF_HOME": HF_HOME,
+    }, flush=True)
+    t = threading.Thread(target=_load_model, daemon=True)
+    t.start()
+
+# ======== Schemas =========
 class GenRequest(BaseModel):
     prompt: str
-    max_new_tokens: Optional[int] = 64
-    temperature: Optional[float] = 0.2
+    max_new_tokens: int | None = 64
 
-def _resolve_model_path() -> str:
-    """Devuelve la ruta local si existe, si no el repo de HF."""
-    try_path = MODEL_DIR
-    if try_path and os.path.exists(try_path):
-        return try_path
-    return MODEL_REPO
-
-def _load_model_background():
-    """Carga el modelo en un hilo aparte para no bloquear el arranque."""
-    try:
-        # Imports dentro del hilo para evitar costo en arranque
-        import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
-
-        # CPU-only settings
-        torch.set_num_threads(int(os.getenv("OMP_NUM_THREADS", "1")))
-        dtype = torch.float32
-
-        local_files_only = not (ALLOW_DOWNLOAD or FORCE_ONLINE)
-        model_path = _resolve_model_path()
-
-        processor = AutoProcessor.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            local_files_only=local_files_only,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-            torch_dtype=dtype,
-            local_files_only=local_files_only,
-        )
-
-        with _lock:
-            _model["processor"] = processor
-            _model["model"] = model
-            _model["ready"] = True
-            _model["error"] = None
-    except Exception as e:
-        with _lock:
-            _model["ready"] = False
-            _model["error"] = f"{type(e).__name__}: {e}"
-
-# Arranca la carga perezosa apenas inicia el proceso (una sola vez)
-threading.Thread(target=_load_model_background, daemon=True).start()
-
-# ----------------- Salud / Ready -----------------
-@app.get("/healthz")
-def healthz():
-    # Salud del proceso web (no del modelo)
-    return {"ok": True}
-
+# ======== Endpoints =========
 @app.get("/status")
 def status():
-    # Alias de salud (por si /healthz recibe tratamiento especial en el edge)
     return {"ok": True}
 
 @app.get("/readyz")
 def readyz():
-    # Listo solo si el modelo está cargado
-    with _lock:
-        ready = bool(_model["ready"] and _model["processor"] and _model["model"])
-        err = _model["error"]
-    if ready:
-        return {"ready": True, "error": None}
-    else:
-        return JSONResponse({"ready": False, "error": err}, status_code=503)
+    return {"ready": model_ready.is_set(), "error": last_error}
 
 @app.get("/_netcheck")
 def netcheck():
-    # Señal mínima de que el proceso está vivo
-    return {"egress": "process-alive"}
+    # Comprobación simple hacia Hugging Face
+    import http.client
+    try:
+        conn = http.client.HTTPSConnection("huggingface.co", timeout=3)
+        conn.request("HEAD", "/")
+        r = conn.getresponse()
+        return {"internet_ok": r.status < 500, "status": r.status}
+    except Exception as e:
+        return {"internet_ok": False, "error": str(e)}
 
-# ----------------- Inference -----------------
+@app.get("/env")
+def env():
+    return {
+        "ALLOW_DOWNLOAD": ALLOW_DOWNLOAD,
+        "FORCE_ONLINE": FORCE_ONLINE,
+        "MODEL_REPO": MODEL_REPO,
+        "MODEL_DIR": MODEL_DIR,
+        "HF_HOME": HF_HOME,
+    }
+
 @app.post("/generate")
 def generate(req: GenRequest):
-    with _lock:
-        ready = bool(_model["ready"] and _model["processor"] and _model["model"])
-        err = _model["error"]
-        processor = _model["processor"]
-        model = _model["model"]
-
-    if not ready:
-        detail = "Model not ready"
-        if err:
-            detail += f": {err}"
-        raise HTTPException(status_code=503, detail=detail)
-
+    if not model_ready.is_set():
+        # Devuelve la misma causa que /readyz
+        raise HTTPException(status_code=503, detail=last_error or "Model not ready.")
     try:
-        import torch
-        # Para texto puro (sin imagen). Para VL real, compón inputs con imágenes también.
-        if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
-            inputs = processor(text=req.prompt, return_tensors="pt")
-            input_ids = inputs.get("input_ids")
-            attention_mask = inputs.get("attention_mask")
-        else:
-            # Fallback: intenta usar tokenizer del processor si expone método
-            inputs = processor(text=req.prompt, return_tensors="pt")
-            input_ids = inputs.get("input_ids")
-            attention_mask = inputs.get("attention_mask")
-
-        gen_kwargs = {
-            "max_new_tokens": req.max_new_tokens or 64,
-        }
-        # Sampling solo si temperature > 0
-        if (req.temperature or 0) > 0:
-            gen_kwargs.update({
-                "do_sample": True,
-                "temperature": float(req.temperature),
-            })
-        else:
-            gen_kwargs.update({
-                "do_sample": False,
-            })
-
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **gen_kwargs,
-            )
-
-        # Decodificar (vía tokenizer del processor)
-        tokenizer = getattr(processor, "tokenizer", None)
-        if tokenizer is None:
-            raise RuntimeError("Processor does not expose a tokenizer for decoding.")
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
+        # Texto puro (sin imagen) — demostración mínima
+        # Para prompts multimodales, habría que aceptar image_url / bytes y pasarlas al processor.
+        inputs = processor(text=req.prompt, return_tensors="pt")
+        out = model.generate(**inputs, max_new_tokens=req.max_new_tokens or 64)
+        # En Qwen2-VL, la decodificación puede variar con trust_remote_code; mantenerlo simple:
+        text = processor.tokenizer.decode(out[0], skip_special_tokens=True)
         return {"text": text}
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"inference error: {e!s}")
